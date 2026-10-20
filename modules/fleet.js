@@ -22,15 +22,23 @@ fleet.selectUnchecked = function(imgs, threshold) {
     return unchecked.length;
 };
 
-fleet.dispatch = function(imgs, threshold) {
+/**
+ * 点击已识别的出征按钮。
+ * 只有调用方已确认需要出征时才可使用；按钮缺失会提示用户而不是猜测点击其他控件。
+ * @param {Object} imgs 已加载的图片资源。
+ * @param {number} [threshold] 模板相似度阈值。
+ * @param {string} [taskName] 发起出征的任务名称。
+ * @param {Function} [logFn] 调度器日志回调。
+ * @returns {boolean} 已找到并点击出征按钮时返回 true。
+ */
+fleet.dispatch = function(imgs, threshold, taskName, logFn) {
     var pos = gh.findFirst(imgs.fleetDispatch, threshold || 0.7, "出征");
     if (pos) {
         console.log("出征按钮位置: (" + pos.x + ", " + pos.y + ")");
         click(pos.x + imgs.fleetDispatch.getWidth() / 2, pos.y + imgs.fleetDispatch.getHeight() / 2);
         return true;
     }
-    console.log("未找到出征按钮");
-    return false;
+    return gh.notifyRequiredPositionMissing(taskName || "舰队", "出征按钮", logFn);
 };
 
 module.exports = fleet;

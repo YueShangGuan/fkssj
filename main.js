@@ -3,26 +3,19 @@
 
 var theme = require("./modules/theme.js");
 var gameHelper = require("./modules/gameHelper.js");
-var plantFood = require("./modules/plantFood.js");
-var fleet = require("./modules/fleet.js");
-var merchantShip = require("./modules/merchantShip.js");
-var war = require("./modules/war.js");
-var weapon = require("./modules/weapon.js");
 var uiHelpers = require("./modules/uiHelpers.js");
 var floatingPanel = require("./modules/floatingPanel.js");
+var scheduler = require("./modules/scheduler.js");
 var navigate = require("./modules/navigate.js");
 
 var C = theme.C;
 var foodOptions = theme.foodOptions;
 
 var loadedImages = null;
-var currentTask = null;
-var selectedTask = "food";
-var runCount = 0;
-var startTime = 0;
+var schedulerRunning = false;
+// 每次启动分配独立会话号；停止后立即重启时，旧线程必须自行退出，不能因全局运行标记重新变为 true 而复活。
+var schedulerSessionId = 0;
 var selectedFood = foodOptions[0];
-var selectedShipMode = "once";
-var selectedWarMode = "attack";
 var harvestStats = floatingPanel.stats;
 var icoBitmap = images.read("./ico.png").getBitmap();
 
@@ -198,20 +191,15 @@ try {
 // ── Init panel state（从持久化配置恢复）──
 if (floatingPanel.selectedFood) selectedFood = floatingPanel.selectedFood;
 else floatingPanel.selectedFood = selectedFood;
-selectedShipMode = floatingPanel.selectedShipMode;
-selectedWarMode = floatingPanel.selectedWarMode;
-selectedTask = floatingPanel.currentTask;
 
 // ── Floating panel context ──
 var panelCtx = {
     C: C, dp: dp, icoBitmap: icoBitmap, foodOptions: foodOptions,
     appendLog: function(msg) { uiHelpers.appendLog(msg); },
     onFoodChange: function(food) { selectedFood = food; floatingPanel.selectedFood = food; },
-    onShipModeChange: function(mode) { selectedShipMode = mode; floatingPanel.selectedShipMode = mode; },
-    onWarModeChange: function(mode) { selectedWarMode = mode; floatingPanel.selectedWarMode = mode; },
-    onTaskChange: function(task) { selectedTask = task; },
-    onRun: function() { startTask(selectedTask); },
-    onStop: function() { stopTask(); }
+    // 仅在总调度器确实启动后折叠控制面板，校验失败时需保留当前配置供用户修正。
+    onRun: function() { return startScheduler(); },
+    onStop: function() { stopScheduler(); }
 };
 
 // ── Init stats display & resolution ──
@@ -224,7 +212,10 @@ try {
     $ui.txt_resolution.setTextColor(colors.parseColor(supported ? C.textPrimary : C.error));
     $ui.txt_resolution_status.setText(supported ? "已适配" : "未适配");
     $ui.txt_resolution_status.setTextColor(colors.parseColor(supported ? C.green : C.error));
-} catch(e) { log("分辨率检测失败: " + e); }
+} catch(e) {
+    // 初始化阶段也需要留存异常文本；尚无截图权限时 appendError 会安全地省略截图。
+    uiHelpers.appendError("分辨率检测失败", e);
+}
 try {
     $ui.txt_device_model.setText(device.brand + " " + device.model);
     var sdkOk = device.sdkInt >= 24;
@@ -284,115 +275,131 @@ $ui.perm_overlay_row.on("click", function() {
     } catch(e) {}
 });
 
-// ── Task management ──
-function startTask(type) {
-    if (currentTask) return;
+// ── 总调度器 ──
+/**
+ * 只允许从总调度页启动，避免任务详情页绕过限时任务的抢占规则。
+ * @returns {boolean} 调度器已接受本次启动请求时返回 true；前置校验未通过时返回 false。
+ */
+function startScheduler() {
+    if (schedulerRunning) return false;
     if (!_allPermsOk) {
         toast("请先开启所需权限");
-        return;
+        return false;
     }
-    var freqs = floatingPanel.readFreqs();
-    currentTask = type; runCount = 0; startTime = Date.now();
-    var names = { food: "种植", weapon: "锻造", ship: "商船", war: "盟战" };
-    uiHelpers.appendLog("[启动] " + names[type] + "任务 (" + freqs[type] + "s)");
-    floatingPanel.runCount = 0;
+    if (!loadedImages) {
+        toast("请先启动游戏并完成资源加载");
+        return false;
+    }
+    if (floatingPanel.getEnabledTasks().length === 0) {
+        toast("请至少开启一个调度任务");
+        floatingPanel.setSchedulerStatus("请至少开启一个任务后再运行");
+        return false;
+    }
+
+    var sessionId = ++schedulerSessionId;
+    schedulerRunning = true;
     floatingPanel.running = true;
     floatingPanel.setRunningUI(true, C);
+    floatingPanel.setSchedulerStatus("调度器启动中");
     uiHelpers.initStats(harvestStats);
-    floatingPanel.showBall(panelCtx);
+    /**
+     * 写入总调度的普通业务事件。
+     * @param {string} message 用户可读的业务描述。
+     */
+    function appendSchedulerLog(message) {
+        uiHelpers.appendLog(message);
+    }
+
+    /**
+     * 写入需要保留现场截图的调度告警。
+     * @param {string} message 用户可读的缺位或页面状态告警。
+     */
+    function appendSchedulerWarning(message) {
+        uiHelpers.appendWarning(message);
+    }
+
+    // gameHelper 仅在必要位置缺失时调用该附加通道，其他调度消息仍按 info 写入。
+    appendSchedulerLog.appendWarning = appendSchedulerWarning;
     threads.start(function() {
-        var shouldStopFn = function() { return currentTask !== type; };
-        // 整点万吨商船 - 启动时就运行（在主任务之前）
-        if ((type === "food" || type === "weapon") && floatingPanel.shipInFood && floatingPanel.shipRunOnStart) {
-            var _shipLog = function(msg) { uiHelpers.appendLog(msg); };
-            merchantShip.runHourlyOnce(loadedImages, _shipLog, shouldStopFn);
-            if (shouldStopFn()) { stopTask(); return; }
-        }
-        if (type === "food") {
-            var logFn = function(msg) { uiHelpers.appendLog(msg); };
-            // 自动定位到种植区
-            if (!navigate.autoLocate(loadedImages, logFn)) {
-                uiHelpers.appendLog("自动定位失败，任务取消");
-                stopTask();
-                return;
-            }
-            sleep(1000);
-            plantFood.run(loadedImages, selectedFood,
-                function(count, msg) {
-                    runCount = count;
-                    floatingPanel.runCount = count;
-                    if (msg.indexOf("完成") !== -1) {
-                        harvestStats.food = (harvestStats.food || 0) + 1;
-                        uiHelpers.updateStats("food", harvestStats);
-                        floatingPanel._saveConfig();
-                    }
-                    uiHelpers.appendLog(msg);
-                },
-                function() { return currentTask !== type; },
-                function(msg) { uiHelpers.appendLog(msg); },
-                function(newFood) {
-                    selectedFood = newFood;
-                    floatingPanel.selectedFood = newFood;
-                    floatingPanel.updateFoodLabel(newFood);
-                },
-                freqs.food,
-                floatingPanel.shipInFood,
-                floatingPanel.shipRunOnStart,
-                function() { return navigate.autoLocate(loadedImages, logFn); }
-            );
-        } else {
-            var shouldStop = function() { return currentTask !== type; };
-            var logFn = function(msg) { uiHelpers.appendLog(msg); };
-            if (type === "weapon") {
-                // 确保在基地界面
-                var scene = navigate.detectScene(loadedImages);
-                if (scene === "world") {
-                    var basePos = gameHelper.findFirst(loadedImages.baseIcon, 0.7, "基地图标");
-                    if (basePos) {
-                        click(basePos.x + loadedImages.baseIcon.getWidth() / 2, basePos.y + loadedImages.baseIcon.getHeight() / 2);
-                        logFn("切换到基地");
-                        sleep(3000);
-                    }
-                } else if (scene === "unknown") {
-                    uiHelpers.appendLog("未在游戏界面，任务取消");
-                    stopTask();
-                    return;
+        try {
+            scheduler.run({
+                images: loadedImages,
+                panel: floatingPanel,
+                // 会话号不匹配说明用户已停止并重新运行；旧线程只能在自己的安全边界退出，不能继续操作当前游戏页面。
+                shouldStop: function() { return !schedulerRunning || sessionId !== schedulerSessionId; },
+                log: appendSchedulerLog,
+                setStatus: function(status) { floatingPanel.setSchedulerStatus(status); },
+                onAction: function(taskKey) {
+                    harvestStats[taskKey] = (harvestStats[taskKey] || 0) + 1;
+                    uiHelpers.updateStats(taskKey, harvestStats);
+                    floatingPanel._saveConfig();
                 }
-                weapon.run(loadedImages, shouldStop, logFn, freqs.weapon, floatingPanel.shipInFood, floatingPanel.shipRunOnStart, floatingPanel.weaponType, floatingPanel.weaponLevel, function() {
-                    harvestStats.weapon = (harvestStats.weapon || 0) + 1;
-                    uiHelpers.updateStats("weapon", harvestStats);
-                    floatingPanel._saveConfig();
-                });
-            }
-            else if (type === "ship") {
-                merchantShip.run(loadedImages, shouldStop, logFn, selectedShipMode, freqs.ship, function() {
-                    harvestStats.ship = (harvestStats.ship || 0) + 1;
-                    uiHelpers.updateStats("ship", harvestStats);
-                    floatingPanel._saveConfig();
-                });
-            }
-            else if (type === "war") {
-                war.run(loadedImages, shouldStop, logFn, selectedWarMode, freqs.war, floatingPanel.warClaimReward, function() {
-                    harvestStats.war = (harvestStats.war || 0) + 1;
-                    uiHelpers.updateStats("war", harvestStats);
-                    floatingPanel._saveConfig();
-                });
-            }
+            });
+        } catch(e) {
+            // 顶层调度异常需要保留堆栈和现场截图，供宿主机拉回后与业务日志一起分析。
+            uiHelpers.appendError("调度器异常", e);
+        } finally {
+            // 旧会话结束不能关闭已经启动的新会话。
+            if (schedulerRunning && sessionId === schedulerSessionId) stopScheduler();
         }
-        floatingPanel._saveConfig();
     });
+    return true;
 }
 
-function stopTask() {
-    var names = { food: "种植", weapon: "锻造", ship: "商船", war: "盟战" };
-    uiHelpers.appendLog("[停止] " + (names[currentTask] || "") + "任务");
-    currentTask = null;
+/**
+ * 请求总调度器在当前原子动作结束后停止，避免中途打断游戏拖拽或页面跳转。
+ */
+function stopScheduler() {
+    if (!schedulerRunning) return;
+    schedulerRunning = false;
+    // 使正在 sleep 或等待页面状态的旧线程永久失效，即使随后立即创建了新会话。
+    schedulerSessionId++;
     floatingPanel.running = false;
     floatingPanel.setRunningUI(false, C);
-    try { var ct = floatingPanel.getCountText(); if (ct) ct.setText(""); } catch(e) {}
+    floatingPanel.setSchedulerStatus("已停止");
+    uiHelpers.appendLog("[停止] 总调度器");
+}
+
+/**
+ * 确保当前 AutoJs 脚本会话拥有可用的录屏会话。
+ *
+ * `requestScreenCaptureAsync()` 会先释放已有会话再重新请求，直接调用会导致每次点击启动都弹出授权。
+ * 已安装的 AutoJs6 6.7.0 可通过 `images.getScreenCaptureOptions()` 判断当前会话是否仍持有截图能力。
+ *
+ * @returns {boolean} 已有或新授予录屏权限时返回 true；用户拒绝时返回 false。
+ */
+function ensureScreenCapturePermission() {
+    if (images.getScreenCaptureOptions()) {
+        uiHelpers.appendLog("已检测到可用录屏权限，跳过申请");
+        return true;
+    }
+
+    uiHelpers.appendLog("未检测到录屏权限，正在申请...");
+    // 点击启动的工作线程可同步等待系统授权结果，避免授权未完成就进入依赖截图的流程。
+    var granted;
+    try {
+        granted = requestScreenCapture(false);
+    } catch (requestError) {
+        // 申请 API 自身异常时也不能让顶层 appendError 尝试截图，避免引发第二次授权。
+        var reason = requestError && requestError.message ? requestError.message : String(requestError);
+        uiHelpers.appendWarning("录屏权限申请失败: " + reason, false);
+        return false;
+    }
+    if (!granted) {
+        // 拒绝场景只持久化 warn 文本；截图会触发 AutoJs 的隐式授权申请，造成二次弹窗。
+        uiHelpers.appendWarning("未授予录屏权限，已取消启动", false);
+        return false;
+    }
+
+    uiHelpers.appendLog("录屏权限已授予");
+    return true;
 }
 
 // ── Launch ──
+/**
+ * 启动游戏并准备调度器依赖的图片资源。
+ * 录屏会话会优先复用，只有当前脚本运行时未持有会话时才请求用户授权。
+ */
 $ui.btn_launch.on("click", function() {
     if (!_allPermsOk) {
         toast("请先开启所需权限");
@@ -402,13 +409,25 @@ $ui.btn_launch.on("click", function() {
     threads.start(function() {
         try {
             app.launchApp("疯狂水世界")
-            uiHelpers.appendLog("游戏已启动，等待录屏权限...");
+            uiHelpers.appendLog("游戏已启动，检查录屏权限...");
             sleep(1000);
-            requestScreenCaptureAsync(false);
+            if (!ensureScreenCapturePermission()) return;
+            // 保持原有的稳定等待窗口，避免刚授权后的首帧仍受系统授权动画影响。
             sleep(1000);
             loadedImages = gameHelper.loadImages();
+            // 公共缺位入口先写告警和截图，再通过该处理器使用当前会话的模板安全恢复主页。
+            gameHelper.setMainSceneRecovery(function(taskName, positionName, logFn) {
+                return navigate.recoverToMainScene(loadedImages, function() { return !schedulerRunning; }, function(message) {
+                    var contextualMessage = "[" + taskName + " / " + positionName + "] " + message;
+                    if (typeof logFn === "function") logFn(contextualMessage);
+                    else uiHelpers.appendLog(contextualMessage);
+                });
+            });
             uiHelpers.appendLog("资源加载完成");
             floatingPanel.showBall(panelCtx);
-        } catch(e) { uiHelpers.appendLog("启动失败: " + e.message); }
+        } catch(e) {
+            // 截图权限尚未授予时 appendError 会仅记录错误文本，不会掩盖原始启动异常。
+            uiHelpers.appendError("启动失败", e);
+        }
     });
 });
