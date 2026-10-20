@@ -31,6 +31,22 @@
 2. 在 AutoJs6 中打开 `main.js` 运行
 3. 点击主界面右上角启动按钮，授予录屏权限后即可使用
 
+## 运行日志与 AI 分析
+
+每次脚本运行都会将业务日志追加到设备的 `/sdcard/水世界运行日志/`，使用 JSONL 格式记录时间、级别、消息、异常堆栈及可用时的错误截图路径。单个日志分段最大 2 MiB，设备仅保留最近 8 次会话；日志不在脚本同步目录内，因此定向同步代码不会覆盖诊断证据。
+
+在 Windows 上运行以下命令可拉取 MuMu 最新会话的全部日志分段和错误截图，并生成最后 300 行的 AI 分析摘要：
+
+```powershell
+pwsh -NoProfile -File .\tools\pull-mumu-runtime-log.ps1
+```
+
+有多个 MuMu 实例时，显式指定设备序列号：
+
+```powershell
+pwsh -NoProfile -File .\tools\pull-mumu-runtime-log.ps1 -Serial emulator-5556
+```
+
 ## 项目结构
 
 ```
