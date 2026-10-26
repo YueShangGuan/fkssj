@@ -9,6 +9,10 @@ var logs = [];
 var switchedFoods = [];
 var missingPositions = [];
 var landDisappearedAfterTap = false;
+var constructionBlueprintVisible = false;
+var constructionBlueprintThresholds = [];
+// 选种界面是否出现与土地纹理命中分离，验证种植必须等待正向页面状态。
+var seedSelectorVisible = true;
 
 /**
  * 创建具有 AutoJs6 图片尺寸接口的模板桩，让种植模块可在 Node 中计算实际点击坐标。
@@ -28,6 +32,7 @@ var imgs = {
     crops: {},
     seeds: {},
     tudi: createTemplate("土地"),
+    constructionBlueprint: createTemplate("建筑蓝图"),
     liandao: createTemplate("镰刀"),
     stockFull: createTemplate("库存已满")
 };
@@ -41,8 +46,13 @@ var gameHelper = {
     findAll: function() { return []; },
     findAllToFilter: function() { return [{ x: 400, y: 1600 }]; },
     findLandStable: function() { return landDisappearedAfterTap ? [] : [{ x: 400, y: 1600 }]; },
-    findFirst: function(image) {
-        return image === imgs.stockFull ? { x: 600, y: 1000 } : { x: 60, y: 2100 };
+    findFirst: function(image, threshold) {
+        if (image === imgs.constructionBlueprint) {
+            constructionBlueprintThresholds.push(threshold);
+            return constructionBlueprintVisible ? { x: 200, y: 600 } : null;
+        }
+        if (image === imgs.stockFull) return { x: 600, y: 1000 };
+        return seedSelectorVisible ? { x: 60, y: 2100 } : null;
     },
     showOverlay: function() {},
     getMaxYPoint: function(points) { return points[0]; },
@@ -55,6 +65,7 @@ var gameHelper = {
 // 仅替换种植模块的图片识别依赖，测试不会调用真实截图或设备触控。
 Module._load = function(request, parent, isMain) {
     if (request === "./gameHelper.js") return gameHelper;
+    if (request === "./navigate.js") return { autoLocate: function() { return true; } };
     return originalLoad.call(this, request, parent, isMain);
 };
 
@@ -73,7 +84,7 @@ try {
     var plantFood = require("../../modules/plantFood.js");
     assert.strictEqual(plantFood.runOnce(
         imgs,
-        "水稻",
+        { foodType: "水稻", intervalSeconds: 30, lastCompletedAt: 0 },
         function() { return false; },
         function(message) { logs.push(message); },
         function(nextFood) { switchedFoods.push(nextFood); }
@@ -96,7 +107,7 @@ try {
     landDisappearedAfterTap = true;
     assert.strictEqual(plantFood.runOnce(
         imgs,
-        "水稻",
+        { foodType: "水稻", intervalSeconds: 30, lastCompletedAt: 0 },
         function() { return false; },
         function(message) { logs.push(message); },
         function(nextFood) { switchedFoods.push(nextFood); }
@@ -106,6 +117,64 @@ try {
     assert.deepStrictEqual(switchedFoods, [], "土地状态未知时不能切换作物");
     assert.deepStrictEqual(missingPositions, [["种植", "播种土地"]]);
     assert.ok(logs.some(function(message) { return message.indexOf("退出选种界面") >= 0; }));
+
+    // 未完工地块会打开建筑蓝图，不能再点击海水空白区假装关闭选种栏；必须通过既有通用回主页链路安全退出。
+    clicks = [];
+    gestures = [];
+    logs = [];
+    switchedFoods = [];
+    missingPositions = [];
+    constructionBlueprintThresholds = [];
+    landDisappearedAfterTap = false;
+    constructionBlueprintVisible = true;
+    assert.strictEqual(plantFood.runOnce(
+        imgs,
+        { foodType: "水稻", intervalSeconds: 30, lastCompletedAt: 0 },
+        function() { return false; },
+        function(message) { logs.push(message); },
+        function(nextFood) { switchedFoods.push(nextFood); }
+    ), true);
+    assert.deepStrictEqual(clicks, [[420, 1640]], "建筑蓝图弹层上不得尝试关闭选种栏");
+    assert.strictEqual(gestures.length, 0, "未完工地块不得开始播种拖拽");
+    assert.deepStrictEqual(switchedFoods, [], "未完工地块不是作物满仓，不能切换作物");
+    assert.deepStrictEqual(missingPositions, [["种植", "已建成可播种农田"]]);
+    assert.deepStrictEqual(constructionBlueprintThresholds, [0.6], "建筑弹层必须使用经现场截图验证的专用阈值");
+    assert.ok(logs.some(function(message) { return message.indexOf("未完工地块") >= 0; }));
+
+    constructionBlueprintVisible = false;
+
+    // 未出现建筑蓝图也不能凭泥土纹理开播；缺少种子图标时同样走通用回主页恢复，且不触发海水坐标点击。
+    clicks = [];
+    gestures = [];
+    logs = [];
+    missingPositions = [];
+    seedSelectorVisible = false;
+    assert.strictEqual(plantFood.runOnce(
+        imgs,
+        { foodType: "水稻", intervalSeconds: 30, lastCompletedAt: 0 },
+        function() { return false; },
+        function(message) { logs.push(message); }
+    ), true);
+    assert.deepStrictEqual(clicks, [[420, 1640]], "未知弹层上不得尝试关闭选种栏");
+    assert.strictEqual(gestures.length, 0, "未确认选种界面不得开始播种拖拽");
+    assert.deepStrictEqual(missingPositions, [["种植", "选种界面"]]);
+    assert.ok(logs.some(function(message) { return message.indexOf("未确认选种界面") >= 0; }));
+
+    // 总调度会在两秒后再次轮转到种植；未到种植自身间隔必须不定位农田、不识图也不触屏。
+    clicks = [];
+    gestures = [];
+    logs = [];
+    assert.strictEqual(plantFood.runOnce(
+        imgs,
+        { foodType: "水稻", intervalSeconds: 30, lastCompletedAt: Date.now() },
+        function() { return false; },
+        function(message) { logs.push(message); }
+    ), false);
+    assert.deepStrictEqual(clicks, [], "种植冷却期不得点击土地或选种栏");
+    assert.deepStrictEqual(gestures, [], "种植冷却期不得开始收割或播种手势");
+    assert.deepStrictEqual(logs, [], "种植正常冷却应保持静默");
+
+    seedSelectorVisible = true;
 } finally {
     Module._load = originalLoad;
 }

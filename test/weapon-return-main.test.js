@@ -87,9 +87,10 @@ global.context = {
 };
 
 var weapon = require("../modules/weapon.js");
+var weaponConfig = { type: "枪械", level: "蓝级", intervalSeconds: 30, lastCompletedAt: 0 };
 
 // 从基地启动锻造后，模块必须在本轮结束前重新回到基地。
-assert.strictEqual(weapon.runOnce(imgs, "枪械", "蓝级", function(message) { logs.push(message); }, function() { return false; }), true);
+assert.strictEqual(weapon.runOnce(imgs, weaponConfig, function(message) { logs.push(message); }, function() { return false; }), true);
 assert.deepStrictEqual(clicks, ["enterForge", "startForge", "returnBase"]);
 assert.ok(logs.indexOf("锻造任务结束，已返回主界面") >= 0);
 
@@ -97,7 +98,7 @@ assert.ok(logs.indexOf("锻造任务结束，已返回主界面") >= 0);
 scene = "base";
 startAvailable = false;
 clicks.length = 0;
-assert.strictEqual(weapon.runOnce(imgs, "枪械", "蓝级", function() {}, function() { return false; }), false);
+assert.strictEqual(weapon.runOnce(imgs, weaponConfig, function() {}, function() { return false; }), false);
 assert.deepStrictEqual(clicks, ["enterForge", "returnBase"]);
 
 // 锻造完成提示关闭后重新开工，也必须在同一轮结束前退出锻造详情页。
@@ -105,15 +106,26 @@ scene = "base";
 startAvailable = true;
 doneVisible = true;
 clicks.length = 0;
-assert.strictEqual(weapon.runOnce(imgs, "枪械", "蓝级", function() {}, function() { return false; }), true);
+assert.strictEqual(weapon.runOnce(imgs, weaponConfig, function() {}, function() { return false; }), true);
 assert.deepStrictEqual(clicks, ["enterForge", "closeDone", "startForge", "returnBase"]);
 
 // 上轮未退出时首先看到的是锻造页；本轮必须先恢复页面，再正常执行并再次退出。
 scene = "forge";
 doneVisible = false;
 clicks.length = 0;
-assert.strictEqual(weapon.runOnce(imgs, "枪械", "蓝级", function() {}, function() { return false; }), true);
+assert.strictEqual(weapon.runOnce(imgs, weaponConfig, function() {}, function() { return false; }), true);
 assert.deepStrictEqual(clicks, ["returnBase", "enterForge", "startForge", "returnBase"]);
+
+// 两秒任务轮转会再次调用锻造模块；未到该任务自己的间隔时必须在任何识图或触控前静默返回。
+scene = "base";
+clicks.length = 0;
+assert.strictEqual(weapon.runOnce(imgs, {
+    type: "枪械",
+    level: "蓝级",
+    intervalSeconds: 30,
+    lastCompletedAt: Date.now()
+}, function() {}, function() { return false; }), false);
+assert.deepStrictEqual(clicks, [], "锻造冷却期不得进入锻造屋或点击页面");
 
 Module._load = originalLoad;
 console.log("weapon return-main test passed");

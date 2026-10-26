@@ -30,6 +30,8 @@ var moduleStubs = {
     "./resourceGather.js": { runOnce: function() { throw new Error("打捞不应执行"); } },
     "./exhibition.js": { runOnce: function() { throw new Error("展区不应执行"); } },
     "./intelligence.js": { runOnce: function() { return { status: "cooldown", waitSeconds: 14400 }; } },
+    // 挂机奖励现属于资源收集任务组；本测试只验证第一项，因此两个地图收集子项均关闭。
+    "./resourceCollection.js": { runOnce: function() { return { experience: { status: "disabled", safe: true }, factory: { status: "disabled", safe: true } }; } },
     "./hangUpReward.js": {
         runOnce: function(imgs, config) {
             calls.push({ intervalHours: config.intervalHours, lastCompletedAt: config.lastCompletedAt });
@@ -55,8 +57,8 @@ Module._load = function(request, parent, isMain) {
 };
 global.sleep = function() {
     sleeps++;
-    // 混合任务场景只让调度器走一轮，用状态文本区分 1 秒普通轮询与错误的小时级独占等待。
-    if (phase === "mixed-cooldown") stop = true;
+    // 冷却任务也只走一次两秒轮转，后续轮次由模块内部直接返回。
+    if (phase === "mixed-cooldown" && sleeps >= 3) stop = true;
 };
 global.log = function() {};
 
@@ -68,14 +70,15 @@ var scheduler = require("../../modules/scheduler.js");
  */
 function makePanel() {
     return {
-        taskEnabled: { weapon: false, food: false, gather: false, tradePort: false, exhibition: false, intelligence: false, hangUpReward: true, ship: false, war: false },
+        taskEnabled: { weapon: false, food: false, gather: false, tradePort: false, exhibition: false, intelligence: false, resourceCollection: true, ship: false, war: false },
         weaponFridayOnly: false,
         weaponType: "枪械",
         weaponLevel: "蓝级",
         selectedFood: "水稻",
         warFleetPlans: [{ mode: "attack", target: "", repairAccelerate: false, marchAccelerate: false }, { mode: "attack", target: "", repairAccelerate: false, marchAccelerate: false }, { mode: "attack", target: "", repairAccelerate: false, marchAccelerate: false }],
         warClaimReward: true,
-        freq: { weapon: 30, food: 30, tradePort: 10, exhibition: 10, intelligence: 4, hangUpReward: 1, ship: 60, war: 20 },
+        freq: { weapon: 30, food: 30, tradePort: 10, exhibition: 10, intelligence: 4, hangUpReward: 1, resourceExperience: 10, resourceFactory: 10, ship: 60, war: 20 },
+        resourceCollection: { hangUpReward: true, experience: false, factory: false },
         gatherIntervalMinutes: 60,
         gatherThresholdPercent: 90,
         gatherDurationMinutes: 5,
@@ -104,7 +107,7 @@ assert.strictEqual(calls[0].intervalHours, 1, "默认完成后间隔必须为 1 
 assert.strictEqual(calls[0].lastCompletedAt, 0);
 // 挂机奖励没有主页统计卡片，与贸易港口、展区一样不应额外触发 onAction。
 assert.strictEqual(actions.length, 0);
-assert.ok(sleeps >= 3600, "首次完成后总调度必须按 1 小时等待");
+assert.strictEqual(sleeps, 2, "首次完成后总调度只应等待两秒并快速进入下一轮");
 
 phase = "restart";
 stop = false;
@@ -122,12 +125,13 @@ assert.strictEqual(calls.length, 1, "重启调度器后应立即重新检查挂�
 assert.strictEqual(calls[0].intervalHours, 1);
 
 /**
- * 验证小时级冷却只在挂机奖励是唯一开启任务时独占等待，避免阻塞其他普通任务的调度节奏。
+ * 验证小时级冷却不会独占总调度，所有任务均由自身冷却分支快速返回。
  */
 function testCooldownDoesNotBlockOtherEnabledTasks() {
     phase = "mixed-cooldown";
     stop = false;
     calls = [];
+    sleeps = 0;
     var statuses = [];
     var mixedPanel = makePanel();
     mixedPanel.taskEnabled.intelligence = true;
@@ -141,10 +145,7 @@ function testCooldownDoesNotBlockOtherEnabledTasks() {
     });
 
     assert.strictEqual(calls.length, 1, "混合任务仍应检查挂机奖励一次");
-    assert.ok(statuses.indexOf("等待已开启的限时任务") >= 0, "混合任务应回到常规调度轮询");
-    assert.strictEqual(statuses.filter(function(status) {
-        return status.indexOf("挂机奖励冷却中") >= 0;
-    }).length, 0, "其他任务开启时不得让挂机奖励独占小时级等待");
+    assert.ok(statuses.indexOf("本轮检查完成，2 秒后继续") >= 0, "混合任务应保持两秒任务轮转");
 }
 
 testCooldownDoesNotBlockOtherEnabledTasks();

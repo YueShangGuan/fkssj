@@ -13,22 +13,21 @@ var recoveryReports = [];
 var directRecoveryAttempts = 0;
 
 /**
- * 用最小桩隔离 AutoJs6 任务模块，并让种植定位后首次场景确认变为未知页面。
+ * 用最小桩隔离 AutoJs6 任务模块，并让种植子方法返回后首次场景确认变为未知页面。
  */
 var moduleStubs = {
     "./weapon.js": { runOnce: function() { throw new Error("锻造不应执行"); } },
-    "./plantFood.js": { runOnce: function() { throw new Error("未知页面后不应进入播种"); } },
+    "./plantFood.js": {
+        // 冷却与定位已封装到种植子模块；这里仅模拟它返回后遗留未知页面。
+        runOnce: function() { calls.push("food"); return false; }
+    },
     "./merchantShip.js": { runOnce: function() { throw new Error("未知页面后不应运行商船"); } },
     "./war.js": { runOnce: function() { throw new Error("未知页面后不应运行盟战"); } },
     "./navigate.js": {
         detectScene: function() {
             sceneChecks += 1;
-            // 调度开始与限时任务后的守卫均正常，种植定位失败后才模拟页面被弹层覆盖。
+            // 调度开始与限时任务后的守卫均正常，种植子方法返回后才模拟页面被弹层覆盖。
             return sceneChecks < 3 ? "base" : "unknown";
-        },
-        autoLocate: function() {
-            calls.push("locate");
-            return false;
         },
         // 页面感知恢复确认失败后，调度器才应进入原有的无触控退避。
         recoverToMainScene: function() {
@@ -103,7 +102,7 @@ try {
         onAction: function() {}
     });
 
-    assert.deepStrictEqual(calls, ["locate"]);
+    assert.deepStrictEqual(calls, ["food"]);
     assert.strictEqual(sceneChecks, 3, "应在调度开始、限时任务后和种植失败后依次确认场景");
     assert.ok(logs.some(function(message) { return message.indexOf("种植后未确认游戏主界面") >= 0; }));
     assert.deepStrictEqual(recoveryReports, [["调度", "种植后游戏主界面"]]);

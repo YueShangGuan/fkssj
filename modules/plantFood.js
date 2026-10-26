@@ -4,21 +4,38 @@ var plantFood = {};
 
 // 当前 MuMu 的游戏分辨率为 1080×2400；此点位是选种栏外左侧海水空白区，不会命中农田或功能入口。
 var SEED_SELECTOR_DISMISS_POINT = { x: 120, y: 1200 };
+// 建造弹层有暗色遮罩，现场截图中蓝图图标的最高匹配分为 0.625；0.60 仍高于普通基地的 0.445 假阳性上界。
+var CONSTRUCTION_BLUEPRINT_THRESHOLD = 0.60;
 
 /**
  * 执行一次收割与播种检查，供总调度器在普通任务轮次中调用。
  * @param {Object} imgs 已加载的作物、种子及农田图片资源。
- * @param {string} foodType 当前优先播种的作物名称。
+ * @param {{foodType: string, intervalSeconds: number, lastCompletedAt: number}} config 当前作物与本会话冷却配置。
  * @param {Function} shouldStop 返回 true 时停止本轮操作。
  * @param {Function} [uiLog] 任务日志回调。
  * @param {Function} [onFoodSwitch] 需要切换作物时的配置更新回调。
  * @returns {boolean} 本轮执行了收割或种植相关操作时返回 true。
  */
-plantFood.runOnce = function(imgs, foodType, shouldStop, uiLog, onFoodSwitch) {
-    var gh = require("./gameHelper.js");
+plantFood.runOnce = function(imgs, config, shouldStop, uiLog, onFoodSwitch) {
     var _log = uiLog || function(msg) { log(msg); };
+    var taskConfig = config || {};
+    var foodType = taskConfig.foodType;
+    var intervalSeconds = Number(taskConfig.intervalSeconds);
+    var lastCompletedAt = Number(taskConfig.lastCompletedAt) || 0;
     var allFoods = ["水稻", "玉米", "土豆", "西红柿", "胡萝卜", "卷心菜", "大豆", "南瓜"];
     var currentFood = foodType;
+    if (!isFinite(intervalSeconds) || intervalSeconds <= 0) {
+        _log("[种植] 配置无效，本轮跳过");
+        return false;
+    }
+    // 高频调度时冷却分支必须完全不识图、不触屏，也不记录正常冷却日志。
+    if (lastCompletedAt && Date.now() - lastCompletedAt < intervalSeconds * 1000) return false;
+    var gh = require("./gameHelper.js");
+    // 商船和盟战可能切换主界面；只有种植确实到期后才定位农田，避免冷却任务在轮转中干扰其他页面。
+    if (!require("./navigate.js").autoLocate(imgs, _log)) {
+        _log("自动定位失败，本轮跳过种植");
+        return false;
+    }
     var cropImg = imgs.crops[currentFood];
     var seedImg = imgs.seeds[currentFood];
     var didSomething = false;
@@ -167,6 +184,21 @@ plantFood.runOnce = function(imgs, foodType, shouldStop, uiLog, onFoodSwitch) {
     _log("点击土地: (" + topLand.x + ", " + topLand.y + ")");
     sleep(2000);
     if (shouldStop()) return false;
+
+    // 未完工地块与空土地共用泥土纹理，不能仅凭初始模板命中开始播种；建筑蓝图弹层是明确的负向状态。
+    if (imgs.constructionBlueprint && gh.findFirst(imgs.constructionBlueprint, CONSTRUCTION_BLUEPRINT_THRESHOLD, "建筑蓝图")) {
+        _log("候选土地打开建筑蓝图，判定为未完工地块，交由通用回主页恢复");
+        // 必要位置缺失入口会复用既有的有限递归回主页链路，禁止在建筑弹层上猜测性点击选种栏外的坐标。
+        gh.notifyRequiredPositionMissing("种植", "已建成可播种农田", _log);
+        return didSomething;
+    }
+
+    // 种子图标出现才证明点击进入选种界面；避免在未完工或其它未知弹层中把后续拖拽落到错误页面。
+    if (!gh.findFirst(seedImg, 0.7, currentFood + "种子")) {
+        _log("点击候选土地后未确认选种界面，交由通用回主页恢复");
+        gh.notifyRequiredPositionMissing("种植", "选种界面", _log);
+        return didSomething;
+    }
 
     land = gh.findLandStable(imgs.tudi, 0.8, "土地", 120);
     gh.showOverlay(land, imgs.tudi);

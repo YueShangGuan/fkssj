@@ -7,14 +7,24 @@ var gh = require("./gameHelper.js");
 /**
  * 执行一次锻造检查与点击，供总调度器在普通任务轮次中调用。
  * @param {Object} loadedImages 已加载的锻造和导航图片。
- * @param {string} weaponType 用户选择的锻造种类。
- * @param {string} weaponLevel 用户选择的锻造等级。
+ * @param {{type: string, level: string, intervalSeconds: number, lastCompletedAt: number}} config 用户配置与本会话完成时间。
  * @param {Function} uiLog 调度器日志回调。
  * @param {Function} shouldStop 是否收到停止请求。
  * @returns {boolean} 本轮是否已启动锻造并确认返回主界面。
  */
-weapon.runOnce = function(loadedImages, weaponType, weaponLevel, uiLog, shouldStop) {
+weapon.runOnce = function(loadedImages, config, uiLog, shouldStop) {
     var _log = uiLog || function() { console.log.apply(null, arguments); };
+    var taskConfig = config || {};
+    var weaponType = taskConfig.type;
+    var weaponLevel = taskConfig.level;
+    var intervalSeconds = Number(taskConfig.intervalSeconds);
+    var lastCompletedAt = Number(taskConfig.lastCompletedAt) || 0;
+    if (!isFinite(intervalSeconds) || intervalSeconds <= 0) {
+        _log("[锻造] 配置无效，本轮跳过");
+        return false;
+    }
+    // 调度器会高频轮转所有任务；冷却判断必须在加载资源、识图和触屏前完成，防止重复进入锻造屋。
+    if (lastCompletedAt && Date.now() - lastCompletedAt < intervalSeconds * 1000) return false;
     if (!loadedImages) { _log("资源未加载，请先启动游戏"); return; }
     var targetImg = loadedImages.duanzao;
     var doneImg = loadedImages.duanzaoDone;

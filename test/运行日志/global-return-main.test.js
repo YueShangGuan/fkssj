@@ -29,7 +29,8 @@ function makeImages() {
         tradePortRewardTitle: makeImage("恭喜获得"),
         rewardDismissHint: makeImage("点击空白区域关闭"),
         exhibitionClose: makeImage("关闭"),
-        exhibitionBack: makeImage("返回")
+        exhibitionBack: makeImage("返回"),
+        genericBack: makeImage("通用返回")
     };
 }
 
@@ -46,6 +47,7 @@ function findVisibleTemplate(imgs, state, image) {
     if (image === imgs.tradePortRewardTitle && state.page === "congrats") return { x: 200, y: 10 };
     if (image === imgs.exhibitionClose && state.page === "dialog") return { x: 300, y: 10 };
     if (image === imgs.exhibitionBack && (state.page === "treasure" || state.page === "exhibition")) return { x: 400, y: 10 };
+    if (image === imgs.genericBack && state.page === "production") return { x: 500, y: 10 };
     return null;
 }
 
@@ -82,6 +84,7 @@ function loadScenario(state, rewardDismissible) {
         else if (x === 305 && state.page === "dialog") state.page = "treasure";
         else if (x === 405 && state.page === "treasure") state.page = "exhibition";
         else if (x === 405 && state.page === "exhibition") state.page = "base";
+        else if (x === 505 && state.page === "production") state.page = "base";
     };
     global.sleep = function() {};
     global.log = function() {};
@@ -115,6 +118,11 @@ try {
     assert.strictEqual(unknownScenario.navigate.recoverToMainScene(unknownScenario.imgs, function() { return false; }, function() {}), false);
     assert.deepStrictEqual(unknownScenario.clicks, []);
     assert.strictEqual(unknownScenario.getSceneChecks(), 6, "无恢复控件时最多执行六轮识别");
+
+    var productionScenario = loadScenario({ page: "production" });
+    assert.strictEqual(productionScenario.navigate.recoverToMainScene(productionScenario.imgs, function() { return false; }, function() {}), true);
+    assert.deepStrictEqual(productionScenario.clicks, [[505, 15]], "未知生产弹层应只点击已识别的通用返回模板");
+    assert.strictEqual(productionScenario.getSceneChecks(), 2, "通用返回后必须重新确认已回主界面");
 } finally {
     Module._load = originalLoad;
 }

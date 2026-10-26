@@ -111,7 +111,7 @@ function waitForConfirmedState(findState, shouldStop) {
  * @param {{intervalHours: number, lastCompletedAt: number}} config 小时级间隔与本会话上次完成时间。
  * @param {Function} shouldStop 停止标记。
  * @param {Function} uiLog 调度器日志回调。
- * @returns {{status: "cooldown"|"completed"|"interrupted"|"failed", waitSeconds: number}} 本轮状态及建议等待秒数。
+ * @returns {{status: "cooldown"|"completed"|"interrupted"|"failed", waitSeconds: number}} 本轮状态及该任务自身的冷却或失败退避秒数；总调度继续短轮转。
  */
 hangUpReward.runOnce = function(imgs, config, shouldStop, uiLog) {
     var _log = uiLog || function(message) { log(message); };
@@ -132,7 +132,6 @@ hangUpReward.runOnce = function(imgs, config, shouldStop, uiLog) {
     // 冷却判断必须先于模板校验、识图和触屏，保证总调度重复调用时完全跳过本任务。
     if (lastCompletedAt && now - lastCompletedAt < intervalMs) {
         var remainingSeconds = Math.max(1, Math.ceil((intervalMs - (now - lastCompletedAt)) / 1000));
-        _log("[挂机奖励] 冷却中，距下次领取还有 " + Math.ceil(remainingSeconds / 3600) + " 小时");
         return { status: "cooldown", waitSeconds: remainingSeconds };
     }
 

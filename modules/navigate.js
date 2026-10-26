@@ -89,6 +89,15 @@ navigate.recoverToMainScene = function(imgs, shouldStop, logFn) {
             continue;
         }
 
+        // 生产等非任务弹层不带展区专用返回图，但会显示同一类红色箭头；仅在未知页且专用恢复入口均未命中时使用现场确认的通用模板。
+        var genericBackPoint = imgs.genericBack && gh.findFirst(imgs.genericBack, 0.8, "全局恢复通用返回");
+        if (genericBackPoint) {
+            clickTemplateCenter(genericBackPoint, imgs.genericBack);
+            logRecovery(logFn, "第 " + attempt + " 轮点击通用返回");
+            sleep(900);
+            continue;
+        }
+
         // 未匹配任何恢复控件时仅等待页面动画，不用系统返回或坐标点击扩大异常。
         logRecovery(logFn, "第 " + attempt + " 轮未识别到可安全操作的恢复控件");
         if (attempt < MAIN_SCENE_RECOVERY_ATTEMPTS) sleep(MAIN_SCENE_RECOVERY_RETRY_DELAY_MS);
@@ -124,12 +133,14 @@ navigate.pinchZoomOut = function(_log) {
  * 点击锻造屋并返回，以它作为种植区定位的稳定视觉锚点。
  * @param {Object} imgs 已加载的图片资源。
  * @param {Function} _log 调度器日志回调。
+ * @param {string} [taskName] 发起定位的任务名；用于在必要位置缺失时给出准确提示。
  * @returns {boolean} 锚点来回均已确认时返回 true。
  */
-navigate.goToForgeAndBack = function(imgs, _log) {
+navigate.goToForgeAndBack = function(imgs, _log, taskName) {
+    var owner = taskName || "种植";
     var forgePos = gh.findFirst(imgs.forgeHouse, 0.7, "锻造屋");
     if (!forgePos) {
-        return gh.notifyRequiredPositionMissing("种植", "锻造屋定位锚点", _log);
+        return gh.notifyRequiredPositionMissing(owner, "锻造屋定位锚点", _log);
     }
     click(forgePos.x + imgs.forgeHouse.getWidth() / 2, forgePos.y + imgs.forgeHouse.getHeight() / 2);
     _log("点击锻造屋");
@@ -158,7 +169,7 @@ navigate.goToForgeAndBack = function(imgs, _log) {
         sleep(1500);
         return true;
     }
-    return gh.notifyRequiredPositionMissing("种植", "锻造屋返回", _log);
+    return gh.notifyRequiredPositionMissing(owner, "锻造屋返回", _log);
 };
 
 // 从屏幕中间向左滑动，距离为锻造屋图片宽度

@@ -207,7 +207,7 @@ function deliverAllVisible(imgs, gh, logFn, shouldStop) {
  * @param {Function} uiLog 日志回调。
  * @param {Function} shouldStop 停止标记。
  * @param {Function} onCompleted 完成并关闭弹窗后的持久化回调。
- * @returns {{completed: boolean, waitSeconds: number}} 本次完成状态及下次适合检查前的等待秒数。
+ * @returns {{completed: boolean, waitSeconds: number}} 本次完成状态及该任务自身的剩余冷却秒数；总调度不会据此长时间休眠。
  */
 tradePort.runOnce = function(imgs, intervalMinutes, lastCompletedAt, uiLog, shouldStop, onCompleted) {
     var _log = uiLog || function(msg) { log(msg); };
@@ -217,7 +217,6 @@ tradePort.runOnce = function(imgs, intervalMinutes, lastCompletedAt, uiLog, shou
     // 冷却期内直接返回，不截图也不触屏，避免每轮总调度重复打开港口。
     if (lastCompletedAt && now - lastCompletedAt < intervalMs) {
         var remainingSeconds = Math.ceil((intervalMs - (now - lastCompletedAt)) / 1000);
-        _log("[贸易港口] 距下次检查还有 " + Math.ceil(remainingSeconds / 60) + " 分钟，跳过");
         return { completed: false, waitSeconds: remainingSeconds };
     }
     // 只有真正执行时才加载识图库，冷却分支不产生任何图像读取或触屏相关依赖。

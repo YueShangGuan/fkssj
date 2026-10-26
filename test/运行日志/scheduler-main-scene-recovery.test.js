@@ -10,10 +10,10 @@ var stop = false;
 var directRecoveryCalls = 0;
 
 var moduleStubs = {
-    "./weapon.js": { runOnce: function() { throw new Error("恢复后不应继续旧轮次"); } },
-    "./plantFood.js": { runOnce: function() { throw new Error("恢复后不应继续旧轮次"); } },
-    "./merchantShip.js": { runOnce: function() { throw new Error("恢复后不应继续旧轮次"); } },
-    "./war.js": { runOnce: function() { throw new Error("恢复后不应继续旧轮次"); } },
+    "./weapon.js": { runOnce: function() { throw new Error("停止请求已生效，恢复后不应执行任务"); } },
+    "./plantFood.js": { runOnce: function() { throw new Error("停止请求已生效，恢复后不应执行任务"); } },
+    "./merchantShip.js": { runOnce: function() { throw new Error("停止请求已生效，恢复后不应执行任务"); } },
+    "./war.js": { runOnce: function() { throw new Error("停止请求已生效，恢复后不应执行任务"); } },
     "./navigate.js": {
         detectScene: function() { return "unknown"; },
         // 入口线程的回调不可见时，调度线程必须直接调用同一套有限恢复链路。
@@ -30,11 +30,11 @@ var moduleStubs = {
             return false;
         }
     },
-    "./resourceGather.js": { runOnce: function() { throw new Error("恢复后不应继续旧轮次"); } },
-    "./tradePort.js": { runOnce: function() { throw new Error("恢复后不应继续旧轮次"); } },
-    "./exhibition.js": { runOnce: function() { throw new Error("恢复后不应继续旧轮次"); } },
-    "./intelligence.js": { runOnce: function() { throw new Error("恢复后不应继续旧轮次"); } },
-    "./hangUpReward.js": { runOnce: function() { throw new Error("恢复后不应继续旧轮次"); } }
+    "./resourceGather.js": { runOnce: function() { throw new Error("停止请求已生效，恢复后不应执行任务"); } },
+    "./tradePort.js": { runOnce: function() { throw new Error("停止请求已生效，恢复后不应执行任务"); } },
+    "./exhibition.js": { runOnce: function() { throw new Error("停止请求已生效，恢复后不应执行任务"); } },
+    "./intelligence.js": { runOnce: function() { throw new Error("停止请求已生效，恢复后不应执行任务"); } },
+    "./hangUpReward.js": { runOnce: function() { throw new Error("停止请求已生效，恢复后不应执行任务"); } }
 };
 
 /**
@@ -56,7 +56,7 @@ try {
     scheduler.run({
         images: {},
         panel: {
-            taskEnabled: { weapon: false, food: false, gather: false, tradePort: false, exhibition: false, intelligence: false, hangUpReward: false, ship: false, war: false },
+            taskEnabled: { weapon: false, food: false, gather: false, tradePort: false, exhibition: false, intelligence: false, resourceCollection: false, ship: false, war: false },
             weaponFridayOnly: false,
             freq: { weapon: 30, food: 30, tradePort: 10, exhibition: 10, intelligence: 4, hangUpReward: 1, ship: 60, war: 20 },
             gatherIntervalMinutes: 60,
@@ -77,7 +77,7 @@ try {
     assert.deepStrictEqual(recoveryReports, [["调度", "调度开始时游戏主界面"]]);
     assert.strictEqual(directRecoveryCalls, 1, "告警回调未恢复时调度线程应直接执行页面感知恢复");
     assert.ok(logs.some(function(message) { return message.indexOf("已恢复主界面") >= 0; }));
-    assert.ok(statuses.indexOf("已回到主界面，重新开始本轮") >= 0);
+    assert.ok(statuses.indexOf("已回到主界面，继续本轮后续任务") >= 0);
 } finally {
     Module._load = originalLoad;
 }

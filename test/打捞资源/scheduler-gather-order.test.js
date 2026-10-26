@@ -24,23 +24,39 @@ var moduleStubs = {
         // 场景桩始终已确认，恢复分支不可达；替身避免 Node 解析 AutoJs XML UI。
         reportRequiredPositionMissing: function() { throw new Error("调度顺序测试不应进入缺位恢复"); }
     },
-    "./tradePort.js": { runOnce: function() { calls.push("tradePort"); return tradePortRunResult; } },
-    "./resourceGather.js": { runOnce: function() { calls.push("gather"); return gatherRunResult; } },
-    "./exhibition.js": { runOnce: function() { calls.push("exhibition"); return { status: "cooldown", waitSeconds: 1 }; } }
+    "./tradePort.js": { runOnce: function() {
+        calls.push("tradePort");
+        // 冷却场景没有展区收尾动作；贸易港口被检查一次后结束该测试轮，避免新的短轮询持续运行。
+        if (gatherRunResult === "cooldown") stop = true;
+        return tradePortRunResult;
+    } },
+    "./resourceGather.js": { runOnce: function() {
+        calls.push("gather");
+        // 只有资源模块已经返回未确认状态时才结束用例；此前的任务间短等待必须继续执行。
+        if (gatherRunResult === "unconfirmed") stop = true;
+        return gatherRunResult;
+    } },
+    "./exhibition.js": { runOnce: function() {
+        calls.push("exhibition");
+        // 完整普通任务顺序在展区结束后已验证，无须让总调度开始下一轮。
+        stop = true;
+        return { status: "cooldown", waitSeconds: 1 };
+    } }
 };
 
 Module._load = function(request, parent, isMain) {
     if (moduleStubs[request]) return moduleStubs[request];
     return originalLoad.call(this, request, parent, isMain);
 };
-global.sleep = function() { stop = true; };
+// 正常任务间会有短等待；停止标记由对应的末尾任务桩设置，避免在同一轮的前置动作后提前终止。
+global.sleep = function() {};
 global.log = function() {};
 
 var scheduler = require("../../modules/scheduler.js");
 
 /**
- * 用指定的资源任务结果运行一个调度轮次，验证该结果是否会错误地放行后续任务。
- * @param {"completed"|"unconfirmed"} result 资源模块本轮返回状态。
+ * 用指定的资源任务结果运行一个调度轮次，验证当前采集失败不会错误地丢弃同轮后续任务。
+ * @param {"completed"|"failed"|"unconfirmed"} result 资源模块本轮返回状态。
  * @returns {string[]} 本轮实际执行的任务标识。
  */
 function runSchedulerScenario(result) {
@@ -76,9 +92,12 @@ function runSchedulerScenario(result) {
     return calls;
 }
 
-assert.deepStrictEqual(runSchedulerScenario("completed"), ["weapon", "locate", "food", "gather", "tradePort", "exhibition"]);
-// 设施菜单未确认时必须在资源任务边界截断，不能把贸易港口或展区点击落到该菜单上。
-assert.deepStrictEqual(runSchedulerScenario("unconfirmed"), ["weapon", "locate", "food", "gather"]);
+// 本用例只验证业务任务顺序；种植前的定位属于种植模块内部准备，不能作为总调度任务顺序的断言项。
+assert.deepStrictEqual(runSchedulerScenario("completed"), ["weapon", "food", "gather", "tradePort", "exhibition"]);
+// 资源模块已自行返回并确认主界面时，失败仅结束本次采集，后续任务可继续执行。
+assert.deepStrictEqual(runSchedulerScenario("failed"), ["weapon", "food", "gather", "tradePort", "exhibition"]);
+// 仅在资源模块尝试返回后仍无法确认主界面时阻断本轮，避免后续任务触碰残留菜单。
+assert.deepStrictEqual(runSchedulerScenario("unconfirmed"), ["weapon", "food", "gather"]);
 
 /**
  * 验证打捞资源与贸易港口同时冷却时，不会让任一任务独占完整冷却时间。
@@ -92,7 +111,7 @@ function testMixedCooldownDoesNotBlockOtherTasks() {
     scheduler.run({
         images: {},
         panel: {
-            taskEnabled: { weapon: false, food: false, gather: true, tradePort: true, exhibition: false, intelligence: false, hangUpReward: false, ship: false, war: false },
+            taskEnabled: { weapon: false, food: false, gather: true, tradePort: true, exhibition: false, intelligence: false, resourceCollection: false, ship: false, war: false },
             weaponFridayOnly: false,
             weaponType: "枪械",
             weaponLevel: "蓝级",
@@ -117,10 +136,7 @@ function testMixedCooldownDoesNotBlockOtherTasks() {
         onAction: function() {}
     });
     assert.deepStrictEqual(calls, ["gather", "tradePort"]);
-    assert.ok(statuses.indexOf("等待已开启的限时任务") >= 0);
-    assert.strictEqual(statuses.filter(function(status) {
-        return status.indexOf("冷却中，等待") >= 0;
-    }).length, 0);
+    assert.ok(statuses.indexOf("本轮检查完成，2 秒后继续") >= 0);
 }
 
 testMixedCooldownDoesNotBlockOtherTasks();
