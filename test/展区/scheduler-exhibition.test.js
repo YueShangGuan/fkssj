@@ -45,7 +45,7 @@ Module._load = function(request, parent, isMain) {
 };
 global.sleep = function(milliseconds) {
     sleeps.push(milliseconds);
-    // 第一个秒级等待足以断开无限调度循环；断言的是等待入口传入的状态文本。
+// 第一个短轮转等待足以断开无限调度循环。
     stop = true;
 };
 global.log = function() {};
@@ -83,6 +83,6 @@ scheduler.run({
 assert.deepStrictEqual(calls, ["exhibition", "action:exhibition"]);
 assert.strictEqual(panel.exhibitionLastCompletedAt, 123456);
 assert.strictEqual(saves, 1);
-assert.ok(statuses.indexOf("本轮完成，等待 600 秒") >= 0, "展区成功后必须使用 10 分钟即 600 秒等待");
+assert.ok(statuses.indexOf("本轮检查完成，2 秒后继续") >= 0, "展区成功后总调度只应等待两秒");
 assert.deepStrictEqual(sleeps, [1000]);
 console.log("scheduler exhibition test passed");

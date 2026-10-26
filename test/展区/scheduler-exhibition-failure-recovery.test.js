@@ -10,7 +10,7 @@ var sleeps = [];
 var scene = "base";
 var stop = false;
 
-// 只模拟“展区失败 -> 恢复主界面”的最短调度链，防止未等待时静默开启下一轮。
+// 只模拟“展区失败 -> 恢复主界面”的最短调度链，验证恢复后回到短轮转而不独占退避。
 var moduleStubs = {
     "./weapon.js": { runOnce: function() { throw new Error("不应执行锻造"); } },
     "./plantFood.js": { runOnce: function() { throw new Error("不应执行种植"); } },
@@ -32,7 +32,7 @@ var moduleStubs = {
     "./exhibition.js": {
         runOnce: function() {
             exhibitionCalls++;
-            if (exhibitionCalls > 1) throw new Error("失败恢复后必须先退避，不能立即重跑展区");
+            if (exhibitionCalls > 1) throw new Error("首个两秒轮转内不应立即重跑展区");
             scene = "unknown";
             return { status: "failed", waitSeconds: 60 };
         }
@@ -54,7 +54,7 @@ Module._load = function(request, parent, isMain) {
 };
 global.sleep = function(milliseconds) {
     sleeps.push(milliseconds);
-    // 首个退避秒级等待足够证明已进入等待分支，并阻止测试继续到下一调度轮。
+    // 首个短轮转秒级等待足够证明已进入等待分支，并阻止测试继续到下一调度轮。
     stop = true;
 };
 global.log = function() {};
@@ -64,7 +64,7 @@ try {
     scheduler.run({
         images: {},
         panel: {
-            taskEnabled: { weapon: false, food: false, gather: false, tradePort: false, exhibition: true, intelligence: false, hangUpReward: false, ship: false, war: false },
+            taskEnabled: { weapon: false, food: false, gather: false, tradePort: false, exhibition: true, intelligence: false, resourceCollection: false, ship: false, war: false },
             weaponFridayOnly: false,
             freq: { weapon: 30, food: 30, tradePort: 10, exhibition: 10, intelligence: 4, hangUpReward: 1, ship: 60, war: 20 },
             gatherIntervalMinutes: 60,
@@ -84,7 +84,7 @@ try {
 
     assert.strictEqual(exhibitionCalls, 1);
     assert.strictEqual(recoveryCalls, 1);
-    assert.ok(statuses.indexOf("展区本轮失败，60 秒后重试") >= 0);
+    assert.ok(statuses.indexOf("本轮检查完成，2 秒后继续") >= 0);
     assert.deepStrictEqual(sleeps, [1000]);
 } finally {
     Module._load = originalLoad;

@@ -6,20 +6,13 @@ var BASE_WIDTH = 1080;
 var BASE_HEIGHT = 2400;
 var MAX_COMPLETED_TEAMS = 3;
 var MAX_BUBBLE_CLICKS = 20;
-// 展品气泡的展柜背景各不相同，不能继续用整张截图模板匹配。
-// 以下颜色均取自气泡内“参观券”图标，且四个位置的相对关系不随展柜背景变化。
-var EXHIBITION_BUBBLE_SCAN_REGION = [120, 650, 840, 1200];
-var EXHIBITION_BUBBLE_SCAN_CELL_WIDTH = 180;
-var EXHIBITION_BUBBLE_SCAN_CELL_HEIGHT = 180;
-var EXHIBITION_BUBBLE_ANCHOR_COLOR = "#B5E19C";
-var EXHIBITION_BUBBLE_PATTERN = [
-    [-2, 15, "#7FB08D"], [-17, 21, "#51856B"], [15, 19, "#FFFCFC"], [2, 5, "#7CAE8E"]
-];
-var EXHIBITION_BUBBLE_COLOR_THRESHOLD = 16;
-// 锚点位于参观券内部；此偏移仍落在原模板中心，点击不会落到底下的展柜。
-var EXHIBITION_BUBBLE_CLICK_OFFSET = [21, -32];
-var EXHIBITION_BUBBLE_DISMISS_ATTEMPTS = 4;
+// 气泡会横向摆动且展柜背景各不相同，只匹配气泡本体；每次查找都会重新截图，不能复用上一次坐标。
+var EXHIBITION_BUBBLE_MATCH_THRESHOLD = 0.8;
+var EXHIBITION_BUBBLE_DISMISS_ATTEMPTS = 10;
 var EXHIBITION_BUBBLE_DISMISS_RETRY_DELAY_MS = 400;
+// 单帧漏检可能发生在气泡的横向摆动或点击收起动画期间；连续六帧均未命中才允许判定所有气泡已领取。
+var EXHIBITION_BUBBLE_EMPTY_CONFIRM_ATTEMPTS = 6;
+var MAX_BUBBLE_OBSERVATIONS = MAX_BUBBLE_CLICKS * EXHIBITION_BUBBLE_EMPTY_CONFIRM_ATTEMPTS;
 // “探险完成”横幅和等级结算动画结束后才会显示领奖按钮；有限轮询避免把动画帧误判为页面失败。
 var COMPLETION_CLAIM_ATTEMPTS = 10;
 var COMPLETION_CLAIM_RETRY_DELAY_MS = 500;
@@ -154,94 +147,61 @@ function sortTopToBottom(points) {
 }
 
 /**
- * 将展品气泡内参观券的多点颜色特征适配到当前截图分辨率。
- * 气泡所在展柜会改变背景，只有图标内部的颜色关系可作为稳定识别依据。
- * @param {{x: number, y: number}} scale 当前横纵缩放比例。
- * @returns {Array} 可传给 images.findMultiColors 的相对颜色特征。
+ * 在当前截图中查找一个可领取展览值气泡。
+ * 每次查找都会重新截图，避免横向摆动后继续使用上一次的坐标。
+ * @param {Object} imgs 已加载的图片资源。
+ * @param {Object} gameHelper 游戏公共工具模块。
+ * @returns {Object|null} 当前帧中匹配到的气泡；未找到时返回 null。
  */
-function scaleExhibitionBubblePattern(scale) {
-    var pattern = [];
-    for (var i = 0; i < EXHIBITION_BUBBLE_PATTERN.length; i++) {
-        var item = EXHIBITION_BUBBLE_PATTERN[i];
-        pattern.push([
-            Math.round(item[0] * scale.x),
-            Math.round(item[1] * scale.y),
-            item[2]
-        ]);
-    }
-    return pattern;
+function findExhibitionBubble(imgs, gameHelper) {
+    var image = imgs && imgs.exhibitionBubble;
+    if (!image) return null;
+    var point = gameHelper.findFirst(image, EXHIBITION_BUBBLE_MATCH_THRESHOLD, "展区展品气泡", true);
+    return point ? { point: point, image: image } : null;
 }
 
 /**
- * 在展区可摆放展柜的区域内扫描全部展品气泡。
- * 每个网格仅保留一个候选，可避免同一气泡的相邻抗锯齿像素重复成为点击目标。
- * @param {{x: number, y: number}} scale 当前横纵缩放比例。
- * @param {Function} logFn 日志回调。
- * @returns {Array<{x: number, y: number, anchor: {x: number, y: number}}>|null} 稳定排序后的点击候选；截图或找色不可用时返回 null。
+ * 判断刷新后的命中是否仍是刚点击的同一气泡。
+ * 气泡会在展柜上左右摆动，允许一个气泡宽度的偏移；超过该范围才视为已切换到其他展柜。
+ * @param {Object|null} current 刷新后命中的气泡。
+ * @param {Object} clicked 已点击的气泡。
+ * @returns {boolean} 仍是同一气泡时返回 true。
  */
-function findExhibitionBubbleCandidates(scale, logFn) {
-    if (typeof images === "undefined" || typeof images.findMultiColors !== "function" || typeof captureScreen !== "function") {
-        logFn("[展区] 多点找色不可用，不能安全领取展品气泡");
-        return null;
-    }
-
-    var screen = null;
-    try {
-        screen = captureScreen();
-        if (!screen) {
-            logFn("[展区] 未获取到展品气泡截图");
-            return null;
-        }
-
-        var region = scaleRegion(EXHIBITION_BUBBLE_SCAN_REGION, scale);
-        var cellWidth = Math.max(1, Math.round(EXHIBITION_BUBBLE_SCAN_CELL_WIDTH * scale.x));
-        var cellHeight = Math.max(1, Math.round(EXHIBITION_BUBBLE_SCAN_CELL_HEIGHT * scale.y));
-        var endX = region[0] + region[2];
-        var endY = region[1] + region[3];
-        var pattern = scaleExhibitionBubblePattern(scale);
-        var candidates = [];
-
-        // 用小网格逐格查找，既覆盖全展区，又不会因 findMultiColors 只返回首个命中而遗漏其他展柜。
-        for (var y = region[1]; y < endY; y += cellHeight) {
-            for (var x = region[0]; x < endX; x += cellWidth) {
-                var anchor = images.findMultiColors(screen, EXHIBITION_BUBBLE_ANCHOR_COLOR, pattern, {
-                    region: [x, y, Math.min(cellWidth, endX - x), Math.min(cellHeight, endY - y)],
-                    threshold: EXHIBITION_BUBBLE_COLOR_THRESHOLD
-                });
-                if (!anchor) continue;
-                candidates.push({
-                    x: Math.round(anchor.x + EXHIBITION_BUBBLE_CLICK_OFFSET[0] * scale.x),
-                    y: Math.round(anchor.y + EXHIBITION_BUBBLE_CLICK_OFFSET[1] * scale.y),
-                    anchor: { x: anchor.x, y: anchor.y }
-                });
-            }
-        }
-        return sortTopToBottom(candidates);
-    } catch (e) {
-        logFn("[展区] 展品气泡多点找色异常：" + e.message);
-        return null;
-    } finally {
-        try { if (screen && screen.recycle) screen.recycle(); } catch (e) {}
-    }
+function isSameExhibitionBubble(current, clicked) {
+    if (!current || !clicked) return false;
+    var currentCenterX = current.point.x + current.image.getWidth() / 2;
+    var currentCenterY = current.point.y + current.image.getHeight() / 2;
+    var clickedCenterX = clicked.point.x + clicked.image.getWidth() / 2;
+    var clickedCenterY = clicked.point.y + clicked.image.getHeight() / 2;
+    var maxOffset = Math.max(80, clicked.image.getWidth(), clicked.image.getHeight());
+    return Math.abs(currentCenterX - clickedCenterX) <= maxOffset && Math.abs(currentCenterY - clickedCenterY) <= maxOffset;
 }
 
 /**
- * 判断刷新后的候选是否仍是刚点击的同一气泡。
- * 不把其他展柜的正常气泡视为点击失败，只有锚点仍停留在当前气泡附近才中止本轮。
- * @param {Array<{anchor: {x: number, y: number}}>} candidates 刷新后的全部气泡候选。
- * @param {{anchor: {x: number, y: number}}} clicked 已点击的气泡。
- * @param {{x: number, y: number}} scale 当前横纵缩放比例。
- * @returns {boolean} 同一气泡仍显示时返回 true。
+ * 等待刚点击的展品气泡确实离开当前位置。
+ * 点击动画中的单帧漏检不能证明气泡已经全部领取：只有重新看到另一个展柜气泡，
+ * 或连续多帧均无任何气泡时，才允许调用方继续或结束收集。
+ * @param {Object} imgs 已加载的图片资源。
+ * @param {Object} gameHelper 游戏公共工具模块。
+ * @param {Object} clicked 已点击的气泡。
+ * @param {Function} shouldStop 停止标记。
+ * @returns {"next"|"empty"|null} 已切换到其他气泡、已稳定清空或未能确认。
  */
-function hasUnchangedExhibitionBubble(candidates, clicked, scale) {
-    var maxDistance = Math.max(24, Math.round(60 * Math.max(scale.x, scale.y)));
-    for (var i = 0; i < candidates.length; i++) {
-        var anchor = candidates[i].anchor;
-        if (Math.abs(anchor.x - clicked.anchor.x) <= maxDistance && Math.abs(anchor.y - clicked.anchor.y) <= maxDistance) {
-            return true;
+function waitForClickedBubbleDismissal(imgs, gameHelper, clicked, shouldStop) {
+    var emptyFrames = 0;
+    for (var attempt = 0; attempt < EXHIBITION_BUBBLE_DISMISS_ATTEMPTS && !shouldStop(); attempt++) {
+        sleep(EXHIBITION_BUBBLE_DISMISS_RETRY_DELAY_MS);
+        var remainingBubble = findExhibitionBubble(imgs, gameHelper);
+        if (!remainingBubble) {
+            emptyFrames++;
+            if (emptyFrames >= EXHIBITION_BUBBLE_EMPTY_CONFIRM_ATTEMPTS) return "empty";
+            continue;
         }
+        // 重新识别到任意气泡时，清空连续漏检计数；这是摆动帧而非“已全部领取”。
+        emptyFrames = 0;
+        if (!isSameExhibitionBubble(remainingBubble, clicked)) return "next";
     }
-    return false;
+    return null;
 }
 
 /**
@@ -311,7 +271,6 @@ function isTreasurePage(imgs, gameHelper) {
  * 此处绝不调用收货、领奖或交货按钮，港口仅用于恢复展区所在的地图位置。
  * @param {Object} imgs 已加载的图片资源。
  * @param {Object} gameHelper 游戏公共工具模块。
- * @param {{x: number, y: number}} scale 当前屏幕缩放比例。
  * @param {Object} flow 当前已确认的页面状态。
  * @param {Function} shouldStop 停止标记。
  * @param {Function} logFn 日志回调。
@@ -333,7 +292,17 @@ function enterAndCloseTradePortAnchor(imgs, gameHelper, flow, shouldStop, logFn)
         if (shouldStop()) return false;
     }
 
-    var entryPoint = gameHelper.findFirst(imgs.tradePortEntry, 0.78, "展区贸易港口定位入口");
+    var entryPoint = gameHelper.findFirst(imgs.tradePortEntry, 0.78, "展区贸易港口定位入口", true);
+    if (!entryPoint) {
+        // 初始地图可能停在远离港口的区域；仅复用已有的锻造屋往返与缩小/滑动定位，完成后仍以港口模板二次确认。
+        logFn("[展区] 当前地图未找到贸易港口，执行一次安全定位后重试");
+        navigate.pinchZoomOut(logFn);
+        if (shouldStop()) return false;
+        if (!navigate.goToForgeAndBack(imgs, logFn, "展区") || shouldStop()) return false;
+        navigate.swipeLeft(imgs, logFn);
+        if (shouldStop()) return false;
+        entryPoint = gameHelper.findFirst(imgs.tradePortEntry, 0.78, "展区贸易港口定位入口");
+    }
     if (!entryPoint) {
         return gameHelper.notifyRequiredPositionMissing("展区", "贸易港口定位入口", logFn);
     }
@@ -389,39 +358,46 @@ function enterExhibition(imgs, gameHelper, flow, shouldStop, logFn) {
 
 /**
  * 逐个领取展区中的展品气泡。每次点击后确认该气泡已消失，避免把模板漏检误记为领取成功。
- * @param {{x: number, y: number}} scale 当前横纵缩放比例。
+ * @param {Object} imgs 已加载的图片资源。
+ * @param {Object} gameHelper 游戏公共工具模块。
  * @param {Function} shouldStop 停止标记。
  * @param {Function} logFn 日志回调。
  * @returns {boolean} 所有可见气泡已处理且每次点击均确认消失时返回 true；识别或点击确认异常时返回 false。
  */
-function collectExhibitionBubbles(scale, shouldStop, logFn) {
-    for (var i = 0; i < MAX_BUBBLE_CLICKS && !shouldStop(); i++) {
-        var bubbles = findExhibitionBubbleCandidates(scale, logFn);
-        if (bubbles === null) return false;
-        if (bubbles.length === 0) {
-            logFn("[展区] 展品气泡收集完成");
+function collectExhibitionBubbles(imgs, gameHelper, shouldStop, logFn) {
+    var clicks = 0;
+    var observations = 0;
+    var emptyFrames = 0;
+    while (clicks < MAX_BUBBLE_CLICKS && observations < MAX_BUBBLE_OBSERVATIONS && !shouldStop()) {
+        observations++;
+        var clickedBubble = findExhibitionBubble(imgs, gameHelper);
+        if (!clickedBubble) {
+            // 气泡在横向摆动和领取动画中会短暂失配；连续确认后才能记录完成时间。
+            emptyFrames++;
+            if (emptyFrames >= EXHIBITION_BUBBLE_EMPTY_CONFIRM_ATTEMPTS) {
+                logFn("[展区] 展品气泡收集完成，已点击" + clicks + "个气泡");
+                return true;
+            }
+            sleep(EXHIBITION_BUBBLE_DISMISS_RETRY_DELAY_MS);
+            continue;
+        }
+        emptyFrames = 0;
+        clickTemplateCenter(clickedBubble.point, clickedBubble.image);
+        clicks++;
+        logFn("[展区] 点击展品气泡");
+
+        var dismissal = waitForClickedBubbleDismissal(imgs, gameHelper, clickedBubble, shouldStop);
+        if (dismissal === "empty") {
+            logFn("[展区] 展品气泡收集完成，已点击" + clicks + "个气泡");
             return true;
         }
-        var clickedBubble = bubbles[0];
-        click(clickedBubble.x, clickedBubble.y);
-
-        var dismissed = false;
-        for (var attempt = 0; attempt < EXHIBITION_BUBBLE_DISMISS_ATTEMPTS && !shouldStop(); attempt++) {
-            sleep(EXHIBITION_BUBBLE_DISMISS_RETRY_DELAY_MS);
-            var remainingBubbles = findExhibitionBubbleCandidates(scale, logFn);
-            if (remainingBubbles === null) return false;
-            if (!hasUnchangedExhibitionBubble(remainingBubbles, clickedBubble, scale)) {
-                dismissed = true;
-                break;
-            }
-        }
-        if (!dismissed) {
+        if (dismissal !== "next") {
             if (!shouldStop()) logFn("[展区] 展品气泡点击后仍可识别，本轮停止以避免重复点击");
             return false;
         }
     }
     if (shouldStop()) return false;
-    logFn("[展区] 展品气泡在最大安全次数后仍存在，未继续重复点击");
+    logFn(clicks >= MAX_BUBBLE_CLICKS ? "[展区] 展品气泡在最大安全次数后仍存在，未继续重复点击" : "[展区] 展品气泡识别持续不稳定，未记录完成时间");
     return false;
 }
 
@@ -850,7 +826,16 @@ function tryDispatchSite(imgs, gameHelper, scale, candidate, durationHours, flow
     sleep(800);
     if (shouldStop()) return { ok: false, started: false };
 
-    var addHeroPoint = gameHelper.findFirst(imgs.exhibitionAddHero, 0.8, "展区添加英雄");
+    // 组队弹窗会压暗背景，原始彩色模板容易漏检；灰度匹配只保留加号轮廓，仍仅在已确认的 0/3 组队页点击。
+    var addHeroPoint = gameHelper.findFirstInRegionInGrayscale(
+        imgs.exhibitionAddHero,
+        150,
+        1000,
+        780,
+        360,
+        0.8,
+        "展区添加英雄"
+    );
     if (!addHeroPoint) {
         gameHelper.notifyRequiredPositionMissing("展区", "添加英雄入口", logFn);
         return { ok: false, started: false };
@@ -1030,7 +1015,7 @@ function finishUncompletedRun(imgs, gameHelper, scale, flow, shouldStop, logFn) 
  * @param {Function} shouldStop 停止标记。
  * @param {Function} uiLog 日志回调。
  * @param {Function} onCompleted 主界面确认后的完成时间持久化回调。
- * @returns {{status: "cooldown"|"completed"|"interrupted"|"failed", waitSeconds: number}} 本轮状态与下一次适合调度的等待秒数。
+ * @returns {{status: "cooldown"|"completed"|"interrupted"|"failed", waitSeconds: number}} 本轮状态与该任务自身的冷却或失败退避秒数；总调度继续短轮转。
  */
 exhibition.runOnce = function(imgs, config, shouldStop, uiLog, onCompleted) {
     var _log = uiLog || function(message) { log(message); };
@@ -1052,7 +1037,6 @@ exhibition.runOnce = function(imgs, config, shouldStop, uiLog, onCompleted) {
     // 冷却判断必须先于 require、截图、OCR 和任何点击，确保总调度重入不会打断正在进行的队伍。
     if (lastCompletedAt && now - lastCompletedAt < intervalMs) {
         var remainingSeconds = Math.max(1, Math.ceil((intervalMs - (now - lastCompletedAt)) / 1000));
-        _log("[展区] 冷却中，距下次检查还有 " + Math.ceil(remainingSeconds / 60) + " 分钟");
         return { status: "cooldown", waitSeconds: remainingSeconds };
     }
 
@@ -1072,7 +1056,7 @@ exhibition.runOnce = function(imgs, config, shouldStop, uiLog, onCompleted) {
         if (!enterAndCloseTradePortAnchor(imgs, gameHelper, flow, shouldStop, _log)) {
             return finishUncompletedRun(imgs, gameHelper, scale, flow, shouldStop, _log);
         }
-        if (!enterExhibition(imgs, gameHelper, flow, shouldStop, _log) || !collectExhibitionBubbles(scale, shouldStop, _log)) {
+        if (!enterExhibition(imgs, gameHelper, flow, shouldStop, _log) || !collectExhibitionBubbles(imgs, gameHelper, shouldStop, _log)) {
             return finishUncompletedRun(imgs, gameHelper, scale, flow, shouldStop, _log);
         }
         if (!enterTreasurePage(imgs, gameHelper, flow, shouldStop, _log) || !claimCompletedTeams(imgs, gameHelper, scale, flow, shouldStop, _log)) {

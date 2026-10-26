@@ -10,6 +10,7 @@ var source = fs.readFileSync(sourcePath, "utf8") + [
     "module.exports._test = {",
     "normalizeConfiguredSites: normalizeConfiguredSites,",
     "claimCompletedTeams: claimCompletedTeams,",
+    "enterAndCloseTradePortAnchor: enterAndCloseTradePortAnchor,",
     "enterTreasurePage: enterTreasurePage,",
     "collectExhibitionBubbles: collectExhibitionBubbles,",
     "selectDurationAndStart: selectDurationAndStart,",
@@ -269,6 +270,56 @@ function testMissingTreasureEntryNotifies() {
 }
 
 /**
+ * 验证当前地图未显示港口时，展区只复用一次既有定位链路，再以港口模板确认后才进入。
+ */
+function testTradePortAnchorRetriesAfterSafeLocation() {
+    var imgs = makeImages();
+    var state = { located: false, page: "base", actions: [], entryChecks: 0 };
+    var navigation = {
+        detectScene: function() { return "base"; },
+        pinchZoomOut: function() { state.actions.push("pinch"); },
+        goToForgeAndBack: function(imageSet, logFn, taskName) {
+            assert.strictEqual(imageSet, imgs);
+            assert.strictEqual(taskName, "展区");
+            state.actions.push("forge:" + taskName);
+            state.located = true;
+            return true;
+        },
+        swipeLeft: function(imageSet) {
+            assert.strictEqual(imageSet, imgs);
+            state.actions.push("swipe");
+        }
+    };
+    var loaded = loadExhibition({
+        require: function(modulePath) {
+            assert.strictEqual(modulePath, "./navigate.js");
+            return navigation;
+        },
+        click: function(x) {
+            if (x === 105) state.page = "tradePort";
+            if (x === 205) state.page = "base";
+        }
+    });
+    var gameHelper = {
+        findFirst: function(image) {
+            if (image === imgs.tradePortEntry) {
+                state.entryChecks++;
+                return state.located ? { x: 100, y: 10 } : null;
+            }
+            if (image === imgs.tradePortClose) return state.page === "tradePort" ? { x: 200, y: 10 } : null;
+            return null;
+        }
+    };
+
+    assert.strictEqual(loaded.api._test.enterAndCloseTradePortAnchor(
+        imgs, gameHelper, { page: "main" }, function() { return false; }, function() {}
+    ), true);
+    assert.deepStrictEqual(state.actions, ["pinch", "forge:展区", "swipe"]);
+    assert.strictEqual(state.entryChecks, 2);
+    assert.strictEqual(state.page, "base");
+}
+
+/**
  * 构造可驱动 fillIdleTeams 的寻宝地图桩，模拟地点详情、默认英雄、时长选择与开始探险返回链路。
  * @param {Array<string>} sites 可见且已勾选的地点。
  * @param {number} slotCount 初始空闲队伍槽数量。
@@ -345,10 +396,14 @@ function createDispatchScenario(sites, slotCount, unavailableSites) {
                 state.teamBuildChecks[state.openedSite] = (state.teamBuildChecks[state.openedSite] || 0) + 1;
                 return unavailableSites.indexOf(state.openedSite) >= 0 ? null : { x: 400, y: 20 };
             }
-            if (image === imgs.exhibitionAddHero) return state.page === "team" ? { x: 500, y: 20 } : null;
             if (image === imgs.exhibitionConfirmHero) return state.page === "heroSelect" ? { x: 600, y: 20 } : null;
             if (image === imgs.exhibitionStart) return state.page === "team" ? { x: 700, y: 20 } : null;
             return null;
+        },
+        findFirstInRegionInGrayscale: function(image, x, y, w, h, threshold, name) {
+            assert.strictEqual(image, imgs.exhibitionAddHero);
+            assert.deepStrictEqual([x, y, w, h, threshold, name], [150, 1000, 780, 360, 0.8, "展区添加英雄"]);
+            return state.page === "team" ? { x: 500, y: 20 } : null;
         }
     };
     return { api: loaded.api, imgs: imgs, gameHelper: gameHelper, flow: { page: "treasure" }, state: state };
@@ -426,9 +481,13 @@ function testMissingDefaultHeroStopsDispatchSafely() {
             // 地点图钉点击后模块会先将 flow 标为 unknown；详情关闭模板是该状态转换的实际确认依据。
             if (image === imgs.exhibitionClose) return { x: 900, y: 20 };
             if (image === imgs.exhibitionTeamBuild) return flow.page === "detail" ? { x: 400, y: 20 } : null;
-            if (image === imgs.exhibitionAddHero) return flow.page === "team" ? { x: 500, y: 20 } : null;
             if (image === imgs.exhibitionConfirmHero) return null;
             return null;
+        },
+        findFirstInRegionInGrayscale: function(image, x, y, w, h, threshold, name) {
+            assert.strictEqual(image, imgs.exhibitionAddHero);
+            assert.deepStrictEqual([x, y, w, h, threshold, name], [150, 1000, 780, 360, 0.8, "展区添加英雄"]);
+            return flow.page === "team" ? { x: 500, y: 20 } : null;
         },
         notifyRequiredPositionMissing: function(taskName, positionName) {
             requiredPositionReports.push([taskName, positionName]);
@@ -569,57 +628,64 @@ function testCompletionPageDoesNotUseSystemBack() {
 }
 
 /**
- * 构造展区展品气泡找色场景；每个锚点模拟为独立展柜，避免测试再次依赖含背景的整图模板。
+ * 构造展区展品气泡模板场景；每次查找都返回当前帧的首个气泡，模拟气泡横向摆动后重新定位。
  * @param {boolean} removeAfterClick 是否模拟游戏在点击后移除对应气泡。
+ * @param {number} [transientMissesAfterClick] 移除动画期间连续漏检的帧数。
  * @returns {{api: Object, state: Object}} 可调用 collectExhibitionBubbles 的场景。
  */
-function createBubbleCollectionScenario(removeAfterClick) {
+function createBubbleCollectionScenario(removeAfterClick, transientMissesAfterClick) {
+    var imgs = makeImages();
     var state = {
         bubbles: [
             { x: 869, y: 919 }, { x: 523, y: 1078 }, { x: 863, y: 1287 }, { x: 534, y: 1473 }
         ],
         clicks: [],
-        scanCalls: 0
+        scanCalls: 0,
+        transientMissesRemaining: 0
     };
     var loaded = loadExhibition({
-        captureScreen: function() {
-            return { recycle: function() {} };
-        },
-        images: {
-            findMultiColors: function(screen, anchorColor, pattern, options) {
-                state.scanCalls++;
-                assert.strictEqual(anchorColor, "#B5E19C");
-                assert.strictEqual(pattern.length, 4);
-                assert.strictEqual(options.threshold, 16);
-                return state.bubbles.find(function(bubble) {
-                    return bubble.x >= options.region[0] && bubble.x < options.region[0] + options.region[2] &&
-                        bubble.y >= options.region[1] && bubble.y < options.region[1] + options.region[3];
-                }) || null;
-            }
-        },
         click: function(x, y) {
             state.clicks.push([x, y]);
             if (!removeAfterClick) return;
             state.bubbles = state.bubbles.filter(function(bubble) {
-                // 参观券锚点到实际触点的偏移必须保持稳定，不能点到底下的展柜。
-                return x !== bubble.x + 21 || y !== bubble.y - 32;
+                // 气泡模板中心是唯一点击点；命中后游戏会移除该展柜上的气泡。
+                return x !== bubble.x + 5 || y !== bubble.y + 5;
             });
+            // 实机领取动画可能让所有气泡模板短暂失配，不能把这几帧当成“已全部领取”。
+            state.transientMissesRemaining = transientMissesAfterClick || 0;
         }
     });
-    return { api: loaded.api, state: state };
+    var gameHelper = {
+        findFirst: function(image, threshold, name, silent) {
+            state.scanCalls++;
+            assert.strictEqual(image, imgs.exhibitionBubble);
+            assert.strictEqual(threshold, 0.8);
+            assert.strictEqual(name, "展区展品气泡");
+            assert.strictEqual(silent, true);
+            if (state.transientMissesRemaining > 0) {
+                state.transientMissesRemaining--;
+                return null;
+            }
+            if (state.bubbles.length === 0) return null;
+            var bubble = state.bubbles[0];
+            // 未消失的气泡会左右摆动，仍必须被识别为同一气泡并安全中止。
+            return { x: bubble.x + (state.clicks.length && !removeAfterClick ? 24 : 0), y: bubble.y };
+        }
+    };
+    return { api: loaded.api, state: state, imgs: imgs, gameHelper: gameHelper };
 }
 
 /**
- * 验证不同展柜背景下的四个参观券锚点都会被扫描、依次点击，并在消失后才报告完成。
+ * 验证气泡每次重新模板定位后都会依次点击，并在全部消失后才报告完成。
  */
 function testCollectsAllBubbleColorCandidates() {
     var scenario = createBubbleCollectionScenario(true);
     var logs = [];
     assert.strictEqual(scenario.api._test.collectExhibitionBubbles(
-        { x: 1, y: 1 }, function() { return false; }, function(message) { logs.push(message); }
+        scenario.imgs, scenario.gameHelper, function() { return false; }, function(message) { logs.push(message); }
     ), true);
     assert.deepStrictEqual(scenario.state.clicks, [
-        [890, 887], [544, 1046], [884, 1255], [555, 1441]
+        [874, 924], [528, 1083], [868, 1292], [539, 1478]
     ]);
     assert.strictEqual(scenario.state.bubbles.length, 0);
     assert.ok(scenario.state.scanCalls > 4);
@@ -627,16 +693,30 @@ function testCollectsAllBubbleColorCandidates() {
 }
 
 /**
- * 验证点击后同一气泡仍存在时安全中止，不能将未消失的气泡伪报为领取完成或重复点击。
+ * 验证点击后同一气泡虽横向摆动仍会安全中止，不能将未领取状态伪报为完成或重复点击。
  */
 function testBubbleMustDisappearAfterClick() {
     var scenario = createBubbleCollectionScenario(false);
     var logs = [];
     assert.strictEqual(scenario.api._test.collectExhibitionBubbles(
-        { x: 1, y: 1 }, function() { return false; }, function(message) { logs.push(message); }
+        scenario.imgs, scenario.gameHelper, function() { return false; }, function(message) { logs.push(message); }
     ), false);
     assert.strictEqual(scenario.state.clicks.length, 1);
     assert.ok(logs.some(function(message) { return message.indexOf("点击后仍可识别") >= 0; }));
+}
+
+/**
+ * 验证领取动画连续两帧漏检后，仍会重新识别并领取其他展柜气泡，不能提前记录完成。
+ */
+function testTransientBubbleMissDoesNotFinishCollection() {
+    var scenario = createBubbleCollectionScenario(true, 2);
+    var logs = [];
+    assert.strictEqual(scenario.api._test.collectExhibitionBubbles(
+        scenario.imgs, scenario.gameHelper, function() { return false; }, function(message) { logs.push(message); }
+    ), true);
+    assert.strictEqual(scenario.state.clicks.length, 4, "短暂漏检后仍必须逐个领取所有气泡");
+    assert.strictEqual(scenario.state.bubbles.length, 0);
+    assert.ok(logs.filter(function(message) { return message.indexOf("点击展品气泡") >= 0; }).length === 4);
 }
 
 testCooldownSkipsAllIo();
@@ -646,6 +726,7 @@ testDurationControlCalibration();
 testCompletedRewardLimit();
 testCompletedRewardWaitsForCompletionAnimation();
 testMissingTreasureEntryNotifies();
+testTradePortAnchorRetriesAfterSafeLocation();
 testFillMultipleSlotsWithoutRepeat();
 testUnavailableSiteSkipsToNext();
 testMissingDefaultHeroStopsDispatchSafely();
@@ -655,4 +736,5 @@ testInsufficientAtFourHoursSafelyReturns();
 testCompletionPageDoesNotUseSystemBack();
 testCollectsAllBubbleColorCandidates();
 testBubbleMustDisappearAfterClick();
+testTransientBubbleMissDoesNotFinishCollection();
 console.log("exhibition tests passed");
