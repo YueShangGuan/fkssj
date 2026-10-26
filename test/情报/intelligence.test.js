@@ -44,7 +44,7 @@ function makeImage(name) {
  */
 function makeImages() {
     var names = [
-        "baseIcon", "worldIcon", "tradePortRewardTitle", "rewardDismissHint", "fleetChecked", "fleetDispatch",
+        "baseIcon", "worldIcon", "tradePortRewardTitle", "tradePortInsufficient", "tradePortInsufficientClose", "rewardDismissHint", "fleetChecked", "fleetDispatch",
         "intelligenceEntry", "intelligenceTitle", "intelligenceCompletedCheck", "intelligenceDimBubble",
         "intelligenceGo", "intelligenceBack", "intelligenceFleetClose",
         "intelligenceBubbleChest", "intelligenceBubbleFlag", "intelligenceBubbleTools",
@@ -566,7 +566,7 @@ function testSkippedCandidateDoesNotPersistCompletion() {
     assert.strictEqual(result.waitSeconds, 30);
     assert.deepStrictEqual(state.persisted, []);
     assert.strictEqual(state.page, "base");
-    assert.ok(state.logs.some(function(message) { return message.indexOf("有 1 个气泡未打开详情，未记录完成时间") >= 0; }));
+    assert.ok(state.logs.some(function(message) { return message.indexOf("有 1 个气泡未完成派遣，未记录完成时间") >= 0; }));
 }
 
 /**
@@ -699,9 +699,10 @@ function testFleetWaitSkipsAfterFiveMinutesWithoutIdleFleet() {
  * 构造一次完整情报流程：可选择验证先领奖再派遣并安全回到基地，或在舰队弹窗停止。
  * @param {boolean} stopDuringFleet 是否在首次舰队勾选检查时请求停止。
  * @param {boolean} keepFleetBusy 是否始终不返回自动勾选状态，用于模拟商船驻守期间全舰队忙碌。
+ * @param {boolean} rescueInsufficient 首个候选是否模拟为物资不足的“解救”任务。
  * @returns {{api: Object, imgs: Object, state: Object}} 可执行的流程场景。
  */
-function createRunScenario(stopDuringFleet, keepFleetBusy) {
+function createRunScenario(stopDuringFleet, keepFleetBusy, rescueInsufficient) {
     var imgs = makeImages();
     var state = {
         page: "base",
@@ -709,9 +710,19 @@ function createRunScenario(stopDuringFleet, keepFleetBusy) {
         clicks: [],
         dispatches: 0,
         stopped: false,
-        persisted: []
+        persisted: [],
+        rescueInsufficient: !!rescueInsufficient,
+        hideInsufficientClose: false,
+        insufficientTitleChecks: 0,
+        insufficientCloseChecks: 0,
+        eventKind: "salvage"
     };
     var gameHelper = {
+        // 与生产安全停止接口保持一致，使弹窗关闭按钮缺失时可验证不会继续进入舰队等待。
+        notifyRequiredPositionMissing: function(taskName, positionName, logFn) {
+            logFn("[" + taskName + "] 未识别到必要位置“" + positionName + "”，本轮已停止操作");
+            return false;
+        },
         findAllInGrayscale: function(image) {
             if (state.page === "intelligence" && state.phase === "completed" && image === imgs.intelligenceCompletedCheck) {
                 return [{ x: 125, y: 280 }];
@@ -719,6 +730,8 @@ function createRunScenario(stopDuringFleet, keepFleetBusy) {
             if (state.page !== "intelligence") return [];
             if (state.phase === "normal" && image === imgs.intelligenceBubbleTools) return [{ x: 200, y: 300 }];
             if (state.phase === "normal" && image === imgs.intelligenceBubbleChest) return [{ x: 400, y: 300 }];
+            // 物资不足的解救气泡关闭后仍必须有另一个候选可供本轮继续验证。
+            if (state.phase === "normal" && state.rescueInsufficient && image === imgs.intelligenceBubbleFlag) return [{ x: 600, y: 300 }];
             return [];
         },
         findFirstInRegionInGrayscale: function(image, x) {
@@ -740,7 +753,17 @@ function createRunScenario(stopDuringFleet, keepFleetBusy) {
             if (image === imgs.intelligenceTitle && state.page === "intelligence") return { x: 950, y: 10 };
             if (image === imgs.tradePortRewardTitle && state.page === "reward") return { x: 200, y: 10 };
             if (image === imgs.intelligenceGo && state.page === "candidate") return { x: 300, y: 10 };
-            if (image === imgs.intelligenceEventSalvage && state.page === "event") return { x: 500, y: 10 };
+            if (image === imgs.intelligenceEventSalvage && state.page === "event" && state.eventKind === "salvage") return { x: 500, y: 10 };
+            if (image === imgs.intelligenceEventRescue && state.page === "event" && state.eventKind === "rescue") return { x: 500, y: 10 };
+            if (image === imgs.tradePortInsufficient && state.page === "rescueShortage") {
+                state.insufficientTitleChecks++;
+                return { x: 200, y: 600 };
+            }
+            if (image === imgs.tradePortInsufficientClose && state.page === "rescueShortage") {
+                state.insufficientCloseChecks++;
+                if (state.hideInsufficientClose) return null;
+                return { x: 920, y: 610 };
+            }
             if (image === imgs.intelligenceFleetClose && state.page === "fleet") return { x: 700, y: 10 };
             if (image === imgs.fleetChecked && state.page === "fleet") {
                 if (stopDuringFleet) {
@@ -772,14 +795,23 @@ function createRunScenario(stopDuringFleet, keepFleetBusy) {
                 return 0xFF348CFF;
             }
         },
-        click: function(x) {
+        click: function(x, y) {
             if (x === 15 && state.page === "base") { state.page = "world"; state.clicks.push("world"); return; }
             if (x === 105 && state.page === "world") { state.page = "intelligence"; state.clicks.push("entry"); return; }
             if (x === 115 && state.page === "intelligence" && state.phase === "completed") { state.page = "reward"; state.clicks.push("completed"); return; }
             if (x === 540 && state.page === "reward") { state.page = "intelligence"; state.phase = "normal"; state.clicks.push("reward-close"); return; }
-            if (x === 405 && state.page === "intelligence") { state.page = "candidate"; state.clicks.push("normal"); return; }
+            if (x === 405 && state.page === "intelligence") {
+                state.eventKind = state.rescueInsufficient ? "rescue" : "salvage";
+                state.page = "candidate";
+                state.clicks.push(state.rescueInsufficient ? "rescue-candidate" : "normal");
+                return;
+            }
+            if (x === 605 && state.page === "intelligence") { state.eventKind = "salvage"; state.page = "candidate"; state.clicks.push("normal"); return; }
             if (x === 305 && state.page === "candidate") { state.page = "event"; state.clicks.push("go"); return; }
+            if (x === 505 && state.page === "event" && state.eventKind === "rescue") { state.page = "rescueShortage"; state.clicks.push("rescue-action"); return; }
             if (x === 505 && state.page === "event") { state.page = "fleet"; state.clicks.push("event"); return; }
+            if (x === 925 && y === 615 && state.page === "rescueShortage") { state.page = "rescueEvent"; state.clicks.push("rescue-shortage-close"); return; }
+            if (x === 1000 && y === 1500 && state.page === "rescueEvent") { state.page = "world"; state.clicks.push("rescue-dismiss"); return; }
             if (x === 605 && state.page === "fleet") { state.page = "world"; state.phase = "done"; state.dispatches++; state.clicks.push("dispatch"); return; }
             if (x === 705 && state.page === "fleet") { state.page = "world"; state.clicks.push("fleet-close"); return; }
             if (x === 805 && state.page === "intelligence") { state.page = "world"; state.clicks.push("back"); return; }
@@ -868,6 +900,58 @@ function testBusyFleetSkipsRunAndSafelyReturns() {
     assert.ok(logs.some(function(message) { return message.indexOf("本轮已安全跳过") >= 0; }));
 }
 
+/**
+ * 验证“解救”因物资不足未打开舰队页时，关闭详情卡回到世界并继续处理后续气泡；
+ * 当前气泡没有派遣成功，因此整轮不得写入四小时冷却时间。
+ */
+function testInsufficientRescueContinuesWithOtherIntelligence() {
+    var scenario = createRunScenario(false, false, true);
+    // 本用例只验证物资不足后的候选切换，不让预置完成奖励干扰点击序列。
+    scenario.state.phase = "normal";
+    var logs = [];
+    var result = scenario.api.runOnce(scenario.imgs, { intervalHours: 4, lastCompletedAt: 0 }, function() {
+        return scenario.state.stopped;
+    }, function(message) { logs.push(message); }, function(completedAt) {
+        scenario.state.persisted.push(completedAt);
+    });
+
+    assert.strictEqual(result.status, "failed");
+    assert.strictEqual(result.waitSeconds, 30);
+    assert.strictEqual(scenario.state.dispatches, 1, "物资不足后仍应派遣下一个可用气泡");
+    assert.deepStrictEqual(scenario.state.persisted, []);
+    assert.deepStrictEqual(scenario.state.clicks, [
+        "world", "entry", "rescue-candidate", "go", "rescue-action", "rescue-shortage-close", "rescue-dismiss",
+        "entry", "normal", "go", "event", "dispatch", "entry", "back", "base"
+    ]);
+    assert.strictEqual(scenario.state.page, "base");
+    assert.strictEqual(scenario.state.insufficientTitleChecks, 1, "必须先确认所需产品不足标题");
+    assert.strictEqual(scenario.state.insufficientCloseChecks, 1, "必须点击所需产品不足右上角 X");
+    assert.ok(logs.some(function(message) { return message.indexOf("解救任务物资不足，已关闭详情并返回世界界面") >= 0; }));
+    assert.ok(logs.some(function(message) { return message.indexOf("有 1 个气泡未完成派遣，未记录完成时间") >= 0; }));
+}
+
+/**
+ * 验证已确认缺料弹窗但未识别关闭 X 时安全结束本轮，绝不误把弹窗当成舰队选择页并开始等待空闲舰队。
+ */
+function testInsufficientRescueWithoutCloseDoesNotWaitForFleet() {
+    var scenario = createRunScenario(false, false, true);
+    scenario.state.phase = "normal";
+    scenario.state.hideInsufficientClose = true;
+    var logs = [];
+    var result = scenario.api.runOnce(scenario.imgs, { intervalHours: 4, lastCompletedAt: 0 }, function() {
+        return scenario.state.stopped;
+    }, function(message) { logs.push(message); }, function(completedAt) {
+        scenario.state.persisted.push(completedAt);
+    });
+
+    assert.strictEqual(result.status, "failed");
+    assert.strictEqual(scenario.state.dispatches, 0);
+    assert.strictEqual(scenario.state.insufficientTitleChecks, 1);
+    assert.strictEqual(scenario.state.insufficientCloseChecks, 1);
+    assert.ok(scenario.state.clicks.indexOf("rescue-dismiss") < 0, "未确认关闭 X 时不得点击世界空白处");
+    assert.ok(!logs.some(function(message) { return message.indexOf("所有舰队忙碌") >= 0; }), "缺料弹窗不得进入舰队等待");
+}
+
 testCooldownSkipsAllIo();
 testBubbleCandidatesAreStableAndDeduped();
 testCompletedMarksClaimWithoutOrdinaryBubbleMatch();
@@ -889,4 +973,6 @@ testRewardFirstAndSafeCompletion();
 testRunResumesFromExistingIntelligencePage();
 testStopDoesNotPersistAndSafelyReturns();
 testBusyFleetSkipsRunAndSafelyReturns();
+testInsufficientRescueContinuesWithOtherIntelligence();
+testInsufficientRescueWithoutCloseDoesNotWaitForFleet();
 console.log("intelligence tests passed");

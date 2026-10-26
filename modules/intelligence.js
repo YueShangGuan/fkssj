@@ -26,6 +26,8 @@ var WORLD_SCENE_WAIT_ATTEMPTS = 10;
 var WORLD_SCENE_WAIT_INTERVAL_MS = 400;
 // “恭喜获得”层必须点击物品和底部提示之间的空白区关闭，标题只用于确认弹层已出现。
 var REWARD_EMPTY_CLOSE_POINT = [540, 1800];
+// 关闭“所需产品不足”提示后，详情卡以外的右下方海面可关闭解救详情并回到世界页，不触碰“解救”或任何资源获取入口。
+var RESCUE_EVENT_EMPTY_CLOSE_POINT = [1000, 1500];
 
 // 事件图标覆盖当前情报地图可出现的气泡；不同等级换色由灰度匹配统一处理。
 var BUBBLE_TEMPLATES = [
@@ -141,7 +143,7 @@ function hasRequiredImages(imgs) {
     var required = [
         "baseIcon", "worldIcon", "tradePortRewardTitle", "rewardDismissHint", "fleetChecked", "fleetDispatch",
         "intelligenceEntry", "intelligenceTitle", "intelligenceCompletedCheck", "intelligenceDimBubble",
-        "intelligenceGo", "intelligenceBack", "intelligenceFleetClose"
+        "intelligenceGo", "intelligenceBack", "intelligenceFleetClose", "tradePortInsufficient", "tradePortInsufficientClose"
     ];
     var i;
     for (i = 0; i < BUBBLE_TEMPLATES.length; i++) required.push(BUBBLE_TEMPLATES[i].key);
@@ -610,6 +612,48 @@ function goToCandidateEvent(imgs, gameHelper, candidate, flow, shouldStop, logFn
 }
 
 /**
+ * 在“解救”动作后识别“所需产品不足”弹窗，并按 X、海面空白处的顺序返回世界页。
+ * 标题和右上角 X 必须同时匹配，避免误点“获取”或钻石购买按钮；标题已出现但 X 缺失时安全停止，绝不转入舰队等待。
+ * @param {Object} imgs 已加载的图片资源。
+ * @param {Object} gameHelper 游戏公共工具模块。
+ * @param {Object} flow 当前已确认的页面状态。
+ * @param {Function} shouldStop 停止标记。
+ * @param {Function} logFn 日志回调。
+ * @param {{template: Object, point: {x: number, y: number}}} eventAction 已点击的事件动作。
+ * @returns {boolean|null} 已确认物资不足并安全回到世界页时返回 true；未出现弹窗时返回 null；弹窗未能安全关闭时返回 false。
+ */
+function dismissInsufficientRescueDialog(imgs, gameHelper, flow, shouldStop, logFn, eventAction) {
+    // 非“解救”事件不会出现本弹窗，返回未检测到后继续各自的舰队流程。
+    if (!eventAction || eventAction.template.key !== "intelligenceEventRescue") return null;
+    var insufficientTitle = gameHelper.findFirst(imgs.tradePortInsufficient, 0.8, "情报所需产品不足");
+    if (!insufficientTitle) return null;
+
+    var closePoint = gameHelper.findFirst(imgs.tradePortInsufficientClose, 0.8, "情报所需产品不足关闭");
+    if (!closePoint) {
+        gameHelper.notifyRequiredPositionMissing("情报", "所需产品不足弹窗关闭按钮", logFn);
+        flow.page = "unknown";
+        return false;
+    }
+    // “所需产品不足”是未派遣的失败状态，只能关闭右上角 X，不能误点“获取”或钻石购买。
+    clickTemplateCenter(closePoint, imgs.tradePortInsufficientClose);
+    sleep(700);
+    if (shouldStop()) return false;
+    // 关闭失败提示后仍留在解救详情卡；点击已验证的海面空白处才会回到世界页继续其他情报。
+    click(RESCUE_EVENT_EMPTY_CLOSE_POINT[0], RESCUE_EVENT_EMPTY_CLOSE_POINT[1]);
+    sleep(900);
+    if (shouldStop()) return false;
+    if (!isWorldScene(imgs, gameHelper)) {
+        gameHelper.notifyRequiredPositionMissing("情报", "解救后世界主界面确认", logFn);
+        flow.page = "unknown";
+        return false;
+    }
+
+    flow.page = "world";
+    logFn("[情报] 解救任务物资不足，已关闭详情并返回世界界面，跳过当前气泡");
+    return true;
+}
+
+/**
  * 在世界事件详情中识别六种已知动作之一，并打开舰队选择弹窗。
  * @param {Object} imgs 已加载的图片资源。
  * @param {Object} gameHelper 游戏公共工具模块。
@@ -617,7 +661,7 @@ function goToCandidateEvent(imgs, gameHelper, candidate, flow, shouldStop, logFn
  * @param {Function} shouldStop 停止标记。
  * @param {Function} logFn 日志回调。
  * @param {{template: Object, point: {x: number, y: number}}} eventAction 已在前往后确认的事件动作。
- * @returns {boolean} 已确认舰队选择弹窗时返回 true。
+ * @returns {boolean|string} 已确认舰队选择弹窗时返回 true；物资不足并已安全返回世界页时返回 insufficientMaterials。
  */
 function openFleetDialogForEvent(imgs, gameHelper, flow, shouldStop, logFn, eventAction) {
     if (!eventAction) {
@@ -629,6 +673,10 @@ function openFleetDialogForEvent(imgs, gameHelper, flow, shouldStop, logFn, even
     logFn("[情报] 点击事件按钮：" + eventAction.template.label);
     sleep(1200);
     if (shouldStop()) return false;
+    // 游戏在点击“解救”后才会展示物资不足弹窗；必须优先处理它，不能把该弹窗当成无空闲舰队页。
+    var insufficientResult = dismissInsufficientRescueDialog(imgs, gameHelper, flow, shouldStop, logFn, eventAction);
+    if (insufficientResult === true) return "insufficientMaterials";
+    if (insufficientResult === false) return false;
     if (!gameHelper.findFirst(imgs.intelligenceFleetClose, 0.8, "情报舰队弹窗关闭")) {
         gameHelper.notifyRequiredPositionMissing("情报", "舰队选择弹窗", logFn);
         flow.page = "unknown";
@@ -773,7 +821,7 @@ function finishUncompletedRun(imgs, gameHelper, flow, shouldStop, logFn) {
  * @param {Function} shouldStop 停止标记。
  * @param {Function} uiLog 日志回调。
  * @param {Function} onCompleted 仅在安全回到基地后的完成时间持久化回调。
- * @returns {{status: "cooldown"|"completed"|"interrupted"|"skipped"|"failed", waitSeconds: number}} 本轮状态和建议等待秒数。
+ * @returns {{status: "cooldown"|"completed"|"interrupted"|"skipped"|"failed", waitSeconds: number}} 本轮状态和该任务自身的冷却或失败退避秒数；总调度继续短轮转。
  */
 intelligence.runOnce = function(imgs, config, shouldStop, uiLog, onCompleted) {
     var _log = uiLog || function(message) { log(message); };
@@ -794,7 +842,6 @@ intelligence.runOnce = function(imgs, config, shouldStop, uiLog, onCompleted) {
     // 冷却必须早于 require、截图和任何触屏；总调度并行启用其他任务时可无副作用地跳过情报。
     if (lastCompletedAt && now - lastCompletedAt < intervalMs) {
         var remainingSeconds = Math.max(1, Math.ceil((intervalMs - (now - lastCompletedAt)) / 1000));
-        _log("[情报] 冷却中，距下次检查还有 " + Math.ceil(remainingSeconds / 3600) + " 小时");
         return { status: "cooldown", waitSeconds: remainingSeconds };
     }
     if (!hasRequiredImages(imgs)) {
@@ -825,8 +872,8 @@ intelligence.runOnce = function(imgs, config, shouldStop, uiLog, onCompleted) {
                     return { status: "failed", waitSeconds: 30 };
                 }
                 if (skippedCandidateCount > 0) {
-                    // 有候选未进入详情时不能把其余气泡处理完成误记为整轮完成，保留冷却起点以便下轮重新核验。
-                    _log("[情报] 有 " + skippedCandidateCount + " 个气泡未打开详情，未记录完成时间");
+                    // 气泡未打开详情或已确认物资不足时均不能把其余气泡处理完成误记为整轮完成，保留冷却起点以便下轮重新核验。
+                    _log("[情报] 有 " + skippedCandidateCount + " 个气泡未完成派遣，未记录完成时间");
                     return { status: "failed", waitSeconds: 30 };
                 }
                 var completedAt = Date.now();
@@ -843,10 +890,19 @@ intelligence.runOnce = function(imgs, config, shouldStop, uiLog, onCompleted) {
                 skippedCandidateCount++;
                 continue;
             }
-            if (!eventAction ||
-                !openFleetDialogForEvent(imgs, gameHelper, flow, stopRequested, _log, eventAction)) {
+            if (!eventAction) {
                 return finishUncompletedRun(imgs, gameHelper, flow, stopRequested, _log);
             }
+            var fleetDialogResult = openFleetDialogForEvent(imgs, gameHelper, flow, stopRequested, _log, eventAction);
+            if (fleetDialogResult === "insufficientMaterials") {
+                // 当前气泡虽已安全返回世界页，但未完成派遣；保留冷却起点并继续尝试后续情报。
+                skippedCandidateCount++;
+                if (!enterIntelligencePage(imgs, gameHelper, flow, stopRequested, _log)) {
+                    return finishUncompletedRun(imgs, gameHelper, flow, stopRequested, _log);
+                }
+                continue;
+            }
+            if (fleetDialogResult !== true) return finishUncompletedRun(imgs, gameHelper, flow, stopRequested, _log);
             var fleetDispatchResult = waitForDefaultFleetAndDispatch(imgs, gameHelper, flow, stopRequested, _log);
             if (fleetDispatchResult === "noIdleFleet") {
                 // 仅在已确认舰队弹窗仍打开时收尾，避免为等待商船空档而写入情报冷却时间。

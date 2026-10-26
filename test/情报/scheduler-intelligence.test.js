@@ -9,6 +9,7 @@ var sleeps = [];
 var stop = false;
 var phase = "completed";
 var saves = 0;
+var stopAfterSleeps = 3;
 
 /**
  * 为调度器提供最小任务替身，避免本测试依赖 AutoJs6 识图环境。
@@ -55,8 +56,8 @@ Module._load = function(request, parent, isMain) {
 };
 global.sleep = function(milliseconds) {
     sleeps.push(milliseconds);
-    // 一次秒级等待即可结束调度循环；状态文本断言承担真实等待秒数的验证。
-    stop = true;
+    // 先穿过展区后的两秒轮转，确认情报已被调用，再在轮次末尾停止测试。
+    if (sleeps.length >= stopAfterSleeps) stop = true;
 };
 global.log = function() {};
 
@@ -69,7 +70,7 @@ var scheduler = require("../../modules/scheduler.js");
  */
 function makePanel(enableExhibition) {
     return {
-        taskEnabled: { weapon: false, food: false, gather: false, tradePort: false, exhibition: enableExhibition, intelligence: true, hangUpReward: false, ship: false, war: false },
+        taskEnabled: { weapon: false, food: false, gather: false, tradePort: false, exhibition: enableExhibition, intelligence: true, resourceCollection: false, ship: false, war: false },
         weaponFridayOnly: false,
         weaponType: "枪械",
         weaponLevel: "蓝级",
@@ -104,15 +105,16 @@ assert.strictEqual(calls[0], "exhibition", "情报必须排在展区之后");
 assert.strictEqual(calls[1].name, "intelligence");
 assert.strictEqual(panel.intelligenceLastCompletedAt, 24680, "安全完成回调必须持久化情报时间戳");
 assert.strictEqual(saves, 1);
-assert.ok(statuses.indexOf("本轮完成，等待 14400 秒") >= 0, "完成后必须按 4 小时即 14400 秒等待");
-assert.deepStrictEqual(sleeps, [1000]);
+assert.ok(statuses.indexOf("本轮检查完成，2 秒后继续") >= 0, "完成后总调度只应等待两秒");
+assert.deepStrictEqual(sleeps, [1000, 1000, 1000]);
 
-// 单独开启情报时，冷却分支必须使用模块精确剩余时间，而非进入每秒空转。
+// 单独开启情报时，冷却分支也必须回到两秒任务轮转。
 phase = "cooldown";
 stop = false;
 calls = [];
 statuses = [];
 sleeps = [];
+stopAfterSleeps = 1;
 var cooldownPanel = makePanel(false);
 cooldownPanel.intelligenceLastCompletedAt = 24680;
 scheduler.run({
@@ -126,6 +128,6 @@ scheduler.run({
 
 assert.strictEqual(calls.length, 1);
 assert.strictEqual(calls[0].lastCompletedAt, 24680, "重启调度后必须将持久化完成时间传给情报模块");
-assert.ok(statuses.indexOf("情报冷却中，等待 4321 秒") >= 0, "仅启用情报时必须按剩余冷却等待");
+assert.ok(statuses.indexOf("本轮检查完成，2 秒后继续") >= 0, "仅启用情报也不得按剩余冷却休眠");
 assert.deepStrictEqual(sleeps, [1000]);
 console.log("scheduler intelligence test passed");
