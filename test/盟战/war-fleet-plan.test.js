@@ -10,12 +10,17 @@ var gameHelperPath = path.resolve(__dirname, "../../modules/gameHelper.js");
 var source = fs.readFileSync(warPath, "utf8") + [
     "module.exports._test = {",
     "normalizeCityTarget: normalizeCityTarget,",
+    "ensureWarImages: ensureWarImages,",
     "readPlan: readPlan,",
     "chooseCity: chooseCity,",
+    "openFleetDialog: openFleetDialog,",
+    "readFleetRows: readFleetRows,",
+    "getFleetState: getFleetState,",
     "selectOnlyFleet: selectOnlyFleet,",
     "closeFleetDialog: closeFleetDialog,",
     "processFleet: processFleet,",
     "readSpeedDialog: readSpeedDialog,",
+    "accelerateFleetStatus: accelerateFleetStatus,",
     "useSpeedUpOnce: useSpeedUpOnce,",
     "resetAcceleratedSegments: resetAcceleratedSegments,",
     "segments: acceleratedSegments,",
@@ -114,6 +119,27 @@ function testPlanValidation() {
     assert.strictEqual(loaded.api._test.readPlan([{ mode: "rally", target: "", repairAccelerate: false, marchAccelerate: false }], 0).mode, "rally");
     assert.strictEqual(loaded.api._test.readPlan([{ mode: "invalid", target: "", repairAccelerate: false, marchAccelerate: false }], 0), null);
     assert.strictEqual(loaded.api._test.readPlan([{ mode: "attack", target: "bad", repairAccelerate: false, marchAccelerate: false }], 0), null);
+}
+
+/**
+ * 验证城战模板按需读取，不修改总调度器共享的图片加载清单。
+ */
+function testWarImagesLoadOnDemand() {
+    var combat = image("combat");
+    var diamond = image("diamond");
+    var paths = [];
+    var loaded = loadWar();
+    loaded.context.images = {
+        read: function(path) {
+            paths.push(path);
+            return path.indexOf("交战中") >= 0 ? combat : diamond;
+        }
+    };
+    var imgs = {};
+    assert.strictEqual(loaded.api._test.ensureWarImages(imgs, function() {}), true);
+    assert.strictEqual(imgs.warFleetCombat, combat);
+    assert.strictEqual(imgs.warDiamondSpeedUp, diamond);
+    assert.deepStrictEqual(paths, ["./img/盟战/舰队交战中.png", "./img/盟战/钻石加速.png"]);
 }
 
 /**
@@ -266,13 +292,111 @@ function testSelectOnlyFleet() {
         }
     });
     var rows = [
-        { x: 10, y: 100, checked: true, image: checkedImage },
-        { x: 10, y: 200, checked: true, image: checkedImage },
-        { x: 10, y: 300, checked: false, image: uncheckedImage }
+        { x: 10, y: 100, checked: true, selectable: true, image: checkedImage },
+        { x: 10, y: 200, checked: true, selectable: true, image: checkedImage },
+        { x: 10, y: 300, checked: false, selectable: true, image: uncheckedImage }
     ];
     assert.strictEqual(loaded.api._test.selectOnlyFleet({ fleetChecked: checkedImage, fleetUnchecked: uncheckedImage }, rows, 2, function() {}), true);
     assert.deepStrictEqual(states, [false, false, true]);
     assert.deepStrictEqual(clicks, [0, 1, 2]);
+}
+
+/**
+ * 验证忙碌舰队仅显示详情箭头时，仍与可选舰队合并为完整的三行，
+ * 保证顶部空闲舰队不会被错误改判为第二或第三支舰队。
+ */
+function testFleetRowsKeepBusyFleetSlots() {
+    var checkedImage = image("checked");
+    var uncheckedImage = image("unchecked");
+    var detailArrow = image("detailArrow");
+    var helper = {
+        findAll: function(target) {
+            if (target === checkedImage) return [{ x: 40, y: 100 }];
+            if (target === uncheckedImage) return [];
+            if (target === detailArrow) return [{ x: 900, y: 400 }, { x: 900, y: 700 }];
+            return [];
+        },
+        findFirst: function() { return null; },
+        findFirstInRegion: function() { return null; },
+        notifyRequiredPositionMissing: function() { return false; }
+    };
+    var loaded = loadWar({ helper: helper });
+    var imgs = { fleetChecked: checkedImage, fleetUnchecked: uncheckedImage, warFleetDetailArrow: detailArrow };
+    var rows = loaded.api._test.readFleetRows(imgs);
+    assert.strictEqual(rows.length, 3);
+    assert.strictEqual(rows[0].selectable, true);
+    assert.strictEqual(rows[1].selectable, false);
+    assert.strictEqual(rows[2].selectable, false);
+    assert.strictEqual(loaded.api._test.selectOnlyFleet(imgs, rows, 0, function() {}), true);
+}
+
+/**
+ * 验证交战状态既没有复选框也没有详情箭头时，仍占用其原始舰队编号。
+ */
+function testFleetRowsKeepCombatFleetSlots() {
+    var checkedImage = image("checked");
+    var uncheckedImage = image("unchecked");
+    var combatImage = image("combat");
+    var helper = {
+        findAll: function(target) {
+            if (target === checkedImage) return [{ x: 40, y: 400 }];
+            if (target === uncheckedImage) return [{ x: 40, y: 700 }];
+            if (target === combatImage) return [{ x: 800, y: 100 }];
+            return [];
+        },
+        findFirst: function() { return null; },
+        findFirstInRegion: function() { return null; },
+        notifyRequiredPositionMissing: function() { return false; }
+    };
+    var loaded = loadWar({ helper: helper });
+    var rows = loaded.api._test.readFleetRows({ fleetChecked: checkedImage, fleetUnchecked: uncheckedImage, warFleetCombat: combatImage });
+    assert.strictEqual(rows.length, 3);
+    assert.strictEqual(rows[0].state, "combat");
+    assert.strictEqual(rows[1].checked, true);
+    assert.strictEqual(rows[2].checked, false);
+}
+
+/**
+ * 验证城战弹窗中可勾选的舰队直接视为空闲，避免“空闲中”文字模板不匹配时跳过实际可出征舰队。
+ */
+function testSelectableFleetIsIdleWithoutIdleTextTemplate() {
+    var loaded = loadWar();
+    assert.strictEqual(loaded.api._test.getFleetState({ selectable: true }), "idle");
+    assert.strictEqual(loaded.api._test.getFleetState({ selectable: false }), "busy");
+}
+
+/**
+ * 验证点击城镇操作后会有限等待标题出现，不会因动画延迟再次点击进攻按钮。
+ */
+function testOpenFleetDialogWaitsForDelayedTitle() {
+    var attack = image("attack");
+    var go = image("go");
+    var title = image("title");
+    var titleChecks = 0;
+    var actionClicks = 0;
+    var loaded = loadWar({
+        helper: {
+            findAll: function() { return []; },
+            findFirst: function(target) {
+                if (target === attack) return { x: 100, y: 100 };
+                if (target === title) {
+                    titleChecks++;
+                    return titleChecks === 3 ? { x: 20, y: 20 } : null;
+                }
+                return null;
+            },
+            findFirstInRegion: function() { return null; },
+            notifyRequiredPositionMissing: function() { return false; }
+        },
+        click: function(x) { if (x === 105) actionClicks++; }
+    });
+    assert.strictEqual(loaded.api._test.openFleetDialog(
+        { fleetAttack: attack, fleetGo: go, warFleetDialogTitle: title },
+        { point: { x: 20, y: 20 }, descriptor: { image: image("city"), label: "进攻" } },
+        function() {}
+    ), true);
+    assert.strictEqual(actionClicks, 1, "标题延迟出现期间不得重复点击进攻按钮");
+    assert.strictEqual(titleChecks, 3);
 }
 
 /**
@@ -329,7 +453,7 @@ function testBusyFleetStatusSkipsWithoutOpeningCity() {
 }
 
 /**
- * 验证维修加速没有标题模板时，仍必须由 OCR 同时确认“维修加速”和倒计时，不能只凭速度x2按钮扣钻石。
+ * 验证维修加速必须由统一标题和倒计时共同确认，不能只凭钻石按钮扣钻石。
  */
 function testRepairSpeedDialogRequiresOcrTitle() {
     var speed = image("speed");
@@ -352,10 +476,37 @@ function testRepairSpeedDialogRequiresOcrTitle() {
             }
         }
     });
-    var imgs = { warSpeedUpX2: speed };
+    var imgs = { warDiamondSpeedUp: speed };
     assert.strictEqual(loaded.api._test.readSpeedDialog(imgs, "repair", function() {}).ok, false);
-    title = "维修加速";
+    title = "加速完成";
     assert.strictEqual(loaded.api._test.readSpeedDialog(imgs, "repair", function() {}).ok, true);
+}
+
+/**
+ * 验证即使调用方误入加速分支，关闭开关的舰队也不能点击详情箭头或钻石按钮。
+ */
+function testDisabledAccelerationNeverOpensSpeedDialog() {
+    var arrow = image("detailArrow");
+    var clicks = 0;
+    var loaded = loadWar({
+        helper: {
+            findAll: function() { return []; },
+            findFirst: function(target) { return target === arrow ? { x: 100, y: 100 } : null; },
+            findFirstInRegion: function() { return null; },
+            notifyRequiredPositionMissing: function() { return false; }
+        },
+        click: function() { clicks++; }
+    });
+    var result = loaded.api._test.accelerateFleetStatus(
+        { warFleetDetailArrow: arrow },
+        { x: 100, y: 100, selectable: false, detailArrow: { x: 100, y: 100 } },
+        "repair",
+        { repairAccelerate: false, marchAccelerate: false },
+        2,
+        function() {}
+    );
+    assert.strictEqual(result.status, "skip");
+    assert.strictEqual(clicks, 0);
 }
 
 /**
@@ -396,18 +547,18 @@ function testSpeedUpOncePerSegmentAndResetOnIdle() {
         ocr: {
             mlkit: {
                 detect: function(screen, region) {
-                    if (region[1] === 800) return dialogOpen ? [{ label: "加速行军" }] : [];
+                    if (region[1] === 800) return dialogOpen ? [{ label: "加速完成" }] : [];
                     if (region[1] === 1000) return [{ label: "00:00:" + (remaining < 10 ? "0" : "") + remaining }];
                     return [];
                 }
             }
         }
     });
-    var imgs = { warMarchSpeedUpTitle: title, warSpeedUpX2: speed, warSpeedDialogClose: close };
+    var imgs = { warDiamondSpeedUp: speed, warSpeedDialogClose: close };
     assert.strictEqual(loaded.api._test.useSpeedUpOnce(imgs, "march", 1, function() {}), true);
     assert.strictEqual(loaded.api._test.useSpeedUpOnce(imgs, "march", 1, function() {}), false);
-    assert.strictEqual(clicks, 2, "速度x2后只允许额外点击一次关闭弹窗");
-    assert.strictEqual(speedClicks, 1, "同一行军段不得重复点击速度x2");
+    assert.strictEqual(clicks, 2, "钻石加速后只允许额外点击一次关闭弹窗");
+    assert.strictEqual(speedClicks, 1, "同一行军段不得重复点击钻石加速");
     assert.strictEqual(closeClicks, 1, "确认加速后仅关闭一次共用弹窗");
     loaded.api._test.segments.repair[1] = true;
     loaded.api._test.resetAcceleratedSegments(1);
@@ -416,6 +567,7 @@ function testSpeedUpOncePerSegmentAndResetOnIdle() {
 }
 
 testPlanValidation();
+testWarImagesLoadOnDemand();
 testRallyTemplateIsLoaded();
 testEmptyTargetUsesFirstCity();
 testConfiguredTargetSelectsExactCity();
@@ -427,8 +579,13 @@ testRallyTargetCanSelectDefenseAfterAttackScan();
 testRallyMissingTargetFallsBackAfterBothLists();
 testRallyUnreadableTargetDoesNotFallback();
 testSelectOnlyFleet();
+testFleetRowsKeepBusyFleetSlots();
+testFleetRowsKeepCombatFleetSlots();
+testSelectableFleetIsIdleWithoutIdleTextTemplate();
+testOpenFleetDialogWaitsForDelayedTitle();
 testCloseFleetDialog();
 testBusyFleetStatusSkipsWithoutOpeningCity();
 testRepairSpeedDialogRequiresOcrTitle();
+testDisabledAccelerationNeverOpensSpeedDialog();
 testSpeedUpOncePerSegmentAndResetOnIdle();
 console.log("war fleet plan test passed");

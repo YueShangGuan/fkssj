@@ -8,6 +8,9 @@ var CITY_OCR_WIDTH = 320;
 var CITY_OCR_HEIGHT = 170;
 var SPEED_TITLE_REGION = [180, 800, 720, 180];
 var SPEED_TIME_REGION = [180, 1000, 720, 210];
+var SPEED_DIALOG_TITLE = "加速完成";
+var FLEET_DIALOG_WAIT_ATTEMPTS = 8;
+var FLEET_DIALOG_WAIT_INTERVAL_MS = 400;
 var WORLD_FLEET_STRIPS = [
     { left: 0.01, width: 0.13 },
     { left: 0.14, width: 0.13 },
@@ -15,6 +18,29 @@ var WORLD_FLEET_STRIPS = [
 ];
 // 仅记住当前脚本进程中的一段倒计时；舰队重新空闲时才允许新的维修/行军再加速一次。
 var acceleratedSegments = { repair: [false, false, false], march: [false, false, false] };
+
+/**
+ * 按需加载城战专用模板，避免共享图片清单的无关任务资源缺失时阻断城战启动。
+ * @param {Object} imgs 总调度器已加载的图片资源。
+ * @param {Function} _log 城战日志回调。
+ * @returns {boolean} 两张本轮必要模板均已加载时返回 true。
+ */
+function ensureWarImages(imgs, _log) {
+    if (imgs.warFleetCombat && imgs.warDiamondSpeedUp) return true;
+    if (typeof images === "undefined" || typeof images.read !== "function") {
+        _log("[城战] 缺少城战模板加载环境，本轮停止操作");
+        return false;
+    }
+    try {
+        // 交战标记与钻石按钮仅在城战流程使用，按需读取可避免影响其他任务的模板依赖。
+        if (!imgs.warFleetCombat) imgs.warFleetCombat = images.read("./img/盟战/舰队交战中.png");
+        if (!imgs.warDiamondSpeedUp) imgs.warDiamondSpeedUp = images.read("./img/盟战/钻石加速.png");
+        return !!imgs.warFleetCombat && !!imgs.warDiamondSpeedUp;
+    } catch (e) {
+        _log("[城战] 加载交战或钻石加速模板失败：" + (e && e.message ? e.message : String(e)));
+        return false;
+    }
+}
 
 /**
  * 规范化用户设置或 OCR 读取到的城镇坐标。
@@ -241,9 +267,21 @@ function openFleetDialog(imgs, city, _log) {
     }
     if (!action || !actionImage) return gh.notifyRequiredPositionMissing("城战", "前往或进攻按钮", _log);
     click(action.x + actionImage.getWidth() / 2, action.y + actionImage.getHeight() / 2);
-    sleep(1200);
-    return !!gh.findFirst(imgs.warFleetDialogTitle, 0.8, "城战舰队选择标题") ||
-        gh.notifyRequiredPositionMissing("城战", "舰队选择弹窗", _log);
+    return waitForFleetDialog(imgs) || gh.notifyRequiredPositionMissing("城战", "舰队选择弹窗", _log);
+}
+
+/**
+ * 在点击城镇操作后有限轮询舰队选择标题。城战动画偶尔超过固定等待时间，
+ * 只重新识图而不补点任何坐标，避免把延迟误判为可再次点击。
+ * @param {Object} imgs 已加载的图片资源。
+ * @returns {boolean} 已确认舰队选择弹窗时返回 true。
+ */
+function waitForFleetDialog(imgs) {
+    for (var attempt = 0; attempt < FLEET_DIALOG_WAIT_ATTEMPTS; attempt++) {
+        if (gh.findFirst(imgs.warFleetDialogTitle, 0.8, "城战舰队选择标题")) return true;
+        if (attempt < FLEET_DIALOG_WAIT_ATTEMPTS - 1) sleep(FLEET_DIALOG_WAIT_INTERVAL_MS);
+    }
+    return false;
 }
 
 /**
@@ -264,41 +302,58 @@ function closeFleetDialog(imgs, _log) {
 }
 
 /**
- * 按纵向顺序收集三支舰队的选择框状态，不能根据模板返回顺序推定舰队编号。
+ * 按纵向顺序收集三支舰队的行状态，不能根据模板返回顺序推定舰队编号。
+ * 忙碌舰队不会显示复选框而只显示详情箭头，必须将两类控件合并，
+ * 才能让空闲舰队的编号不被忙碌舰队挤乱。
  * @param {Object} imgs 已加载的图片资源。
- * @returns {Array<Object>|null} 舰队一至三的复选框状态；数量异常返回 null。
+ * @returns {Array<Object>|null} 舰队一至三的行状态；数量异常返回 null。
  */
 function readFleetRows(imgs) {
     var rows = [];
     var checked = gh.findAll(imgs.fleetChecked, 0.8, "已勾选舰队");
     var unchecked = gh.findAll(imgs.fleetUnchecked, 0.8, "未勾选舰队");
-    for (var i = 0; i < checked.length; i++) rows.push({ x: checked[i].x, y: checked[i].y, checked: true, image: imgs.fleetChecked });
-    for (var j = 0; j < unchecked.length; j++) rows.push({ x: unchecked[j].x, y: unchecked[j].y, checked: false, image: imgs.fleetUnchecked });
+    for (var i = 0; i < checked.length; i++) rows.push({ x: checked[i].x, y: checked[i].y, checked: true, selectable: true, image: imgs.fleetChecked });
+    for (var j = 0; j < unchecked.length; j++) rows.push({ x: unchecked[j].x, y: unchecked[j].y, checked: false, selectable: true, image: imgs.fleetUnchecked });
+    var arrows = gh.findAll(imgs.warFleetDetailArrow, 0.8, "舰队详情箭头");
+    for (var k = 0; k < arrows.length; k++) {
+        var belongsToSelectableRow = false;
+        for (var rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+            if (Math.abs(rows[rowIndex].y - arrows[k].y) <= 120) {
+                belongsToSelectableRow = true;
+                break;
+            }
+        }
+        if (!belongsToSelectableRow) {
+            // 详情箭头代表不可出征的忙碌舰队；保留其行号，后续仅可在状态已确认时进入加速流程。
+            rows.push({ x: arrows[k].x, y: arrows[k].y, checked: false, selectable: false, image: null, detailArrow: arrows[k] });
+        }
+    }
+    var combatMarkers = imgs.warFleetCombat ? gh.findAll(imgs.warFleetCombat, 0.8, "舰队交战中") : [];
+    for (var markerIndex = 0; markerIndex < combatMarkers.length; markerIndex++) {
+        var belongsToKnownRow = false;
+        for (var knownIndex = 0; knownIndex < rows.length; knownIndex++) {
+            if (Math.abs(rows[knownIndex].y - combatMarkers[markerIndex].y) <= 120) {
+                belongsToKnownRow = true;
+                break;
+            }
+        }
+        if (!belongsToKnownRow) {
+            // 交战中的舰队既不能勾选也没有详情箭头；保留该行，防止后续空闲舰队错配到前一支的计划。
+            rows.push({ x: combatMarkers[markerIndex].x, y: combatMarkers[markerIndex].y, checked: false, selectable: false, image: null, state: "combat" });
+        }
+    }
     rows.sort(function(a, b) { return a.y - b.y; });
     return rows.length === FLEET_COUNT ? rows : null;
 }
 
 /**
- * 限制在单一舰队行内查找状态，防止把别的舰队行军或空闲误归属给当前舰队。
- * @param {Object} image 状态模板。
+ * 判断舰队行当前是否可出征。城战弹窗给出复选框即代表该舰队空闲可选；
+ * 忙碌舰队由详情箭头或交战标记保留行号，不能再额外依赖易受缩放影响的“空闲中”文字模板。
  * @param {Object} row 当前舰队复选框位置。
- * @param {string} name 日志中的模板名称。
- * @returns {{x: number, y: number}|null} 匹配位置。
+ * @returns {"idle"|"busy"} 当前可出征状态。
  */
-function findInFleetRow(image, row, name) {
-    if (!image) return null;
-    return gh.findFirstInRegion(image, 0, Math.max(0, row.y - 45), 1080, 190, 0.8, name);
-}
-
-/**
- * 判断舰队行当前是否空闲。非空闲的维修/行军类型必须由底部舰队条确认，不能凭倒计时猜测。
- * @param {Object} imgs 已加载的图片资源。
- * @param {Object} row 当前舰队复选框位置。
- * @returns {"idle"|"busy"} 当前已知状态。
- */
-function getFleetState(imgs, row) {
-    if (findInFleetRow(imgs.fleetIdle, row, "当前舰队空闲中")) return "idle";
-    return "busy";
+function getFleetState(row) {
+    return row.selectable === true ? "idle" : "busy";
 }
 
 /**
@@ -334,7 +389,12 @@ function readWorldFleetStatus(imgs, index) {
  */
 function selectOnlyFleet(imgs, rows, index, _log) {
     for (var i = 0; i < rows.length; i++) {
-        if (i !== index && rows[i].checked) click(rows[i].x + rows[i].image.getWidth() / 2, rows[i].y + rows[i].image.getHeight() / 2);
+        // 忙碌舰队没有复选框；详情箭头不能被当成选择控件点击。
+        if (rows[i].selectable && i !== index && rows[i].checked) click(rows[i].x + rows[i].image.getWidth() / 2, rows[i].y + rows[i].image.getHeight() / 2);
+    }
+    if (!rows[index].selectable) {
+        _log("[城战] 舰队" + (index + 1) + "忙碌且不可勾选，未执行出征");
+        return false;
     }
     if (!rows[index].checked) click(rows[index].x + rows[index].image.getWidth() / 2, rows[index].y + rows[index].image.getHeight() / 2);
     sleep(500);
@@ -343,7 +403,7 @@ function selectOnlyFleet(imgs, rows, index, _log) {
     var count = 0;
     var selectedIndex = -1;
     for (var j = 0; j < verified.length; j++) {
-        if (verified[j].checked) {
+        if (verified[j].selectable && verified[j].checked) {
             count++;
             selectedIndex = j;
         }
@@ -360,6 +420,8 @@ function selectOnlyFleet(imgs, rows, index, _log) {
  * @returns {{x: number, y: number}|null} 对应详情箭头。
  */
 function findDetailArrow(imgs, row) {
+    // 忙碌舰队在选择框位置直接显示箭头，readFleetRows 已按垂直行号归属，不必再次近似匹配。
+    if (row.detailArrow) return row.detailArrow;
     var arrows = gh.findAll(imgs.warFleetDetailArrow, 0.8, "舰队详情箭头");
     var selected = null;
     var distance = Number.MAX_VALUE;
@@ -384,21 +446,29 @@ function parseSeconds(text) {
 }
 
 /**
- * 读取并验证加速窗口：标题、速度x2按钮与倒计时三项必须同时成立。
+ * 判断 OCR 文本是否为游戏当前统一使用的钻石加速弹窗标题。
+ * 维修和行军都显示“加速完成”，具体业务类型只能依赖点击前已确认的舰队状态，不能臆测标题类别。
+ * @param {string} text OCR 识别的弹窗标题区域文字。
+ * @returns {boolean} 已确认是钻石加速弹窗时返回 true。
+ */
+function isSpeedDialogTitle(text) {
+    return String(text || "").replace(/\s/g, "").indexOf(SPEED_DIALOG_TITLE) >= 0;
+}
+
+/**
+ * 读取并验证加速窗口：统一标题、钻石按钮与倒计时三项必须同时成立。
  * @param {Object} imgs 已加载的图片资源。
  * @param {"repair"|"march"} kind 加速类型。
  * @param {Function} _log 城战日志回调。
  * @returns {{ok: boolean, button: Object|null, seconds: number|null}} 已确认的加速窗口数据。
  */
 function readSpeedDialog(imgs, kind, _log) {
-    var title = kind === "repair" ? "维修加速" : "加速行军";
-    // 行军标题可由截图模板和 OCR 双重确认；维修原图尚缺，仅接受标题 OCR 加共用按钮。
-    if (kind === "march" && !gh.findFirst(imgs.warMarchSpeedUpTitle, 0.82, "加速行军标题")) return { ok: false, button: null, seconds: null };
-    var text = readOcrText(SPEED_TITLE_REGION, _log, title + "标题");
-    if (!text.ok || String(text.text || "").replace(/\s/g, "").indexOf(title) < 0) return { ok: false, button: null, seconds: null };
-    var button = gh.findFirst(imgs.warSpeedUpX2, 0.82, "速度x2按钮");
+    var stage = kind === "repair" ? "维修" : "行军";
+    var text = readOcrText(SPEED_TITLE_REGION, _log, stage + "加速弹窗标题");
+    if (!text.ok || !isSpeedDialogTitle(text.text)) return { ok: false, button: null, seconds: null };
+    var button = gh.findFirst(imgs.warDiamondSpeedUp, 0.82, "钻石加速按钮");
     if (!button) return { ok: false, button: null, seconds: null };
-    var timer = readOcrText(SPEED_TIME_REGION, _log, title + "倒计时");
+    var timer = readOcrText(SPEED_TIME_REGION, _log, stage + "加速倒计时");
     var seconds = timer.ok ? parseSeconds(timer.text) : null;
     return { ok: seconds !== null, button: button, seconds: seconds };
 }
@@ -406,25 +476,23 @@ function readSpeedDialog(imgs, kind, _log) {
 /**
  * 在已确认速度x2生效后关闭仍显示的加速窗，恢复到舰队选择页，避免遮挡下一支舰队的操作。
  * @param {Object} imgs 已加载的图片资源。
- * @param {"repair"|"march"} kind 加速类型。
  * @param {Function} _log 城战日志回调。
  * @returns {boolean} 弹窗已经关闭或确认关闭时返回 true。
  */
-function closeSpeedDialog(imgs, kind, _log) {
+function closeSpeedDialog(imgs, _log) {
     var close = gh.findFirst(imgs.warSpeedDialogClose, 0.82, "加速弹窗关闭");
     if (!close) return gh.notifyRequiredPositionMissing("城战", "加速弹窗关闭按钮", _log);
     click(close.x + imgs.warSpeedDialogClose.getWidth() / 2, close.y + imgs.warSpeedDialogClose.getHeight() / 2);
     sleep(600);
-    var expectedTitle = kind === "repair" ? "维修加速" : "加速行军";
     var title = readOcrText(SPEED_TITLE_REGION, _log, "加速窗关闭确认");
     if (!title.ok) return false;
-    if (String(title.text || "").replace(/\s/g, "").indexOf(expectedTitle) < 0) return true;
+    if (!isSpeedDialogTitle(title.text)) return true;
     _log("[城战] 加速窗关闭后标题仍存在，本轮停止后续点击");
     return false;
 }
 
 /**
- * 只对一段维修或行军倒计时点击一次速度x2，并确认倒计时缩短或弹窗被游戏关闭。
+ * 只对一段维修或行军倒计时点击一次钻石加速，并确认倒计时缩短或弹窗被游戏关闭。
  * @param {Object} imgs 已加载的图片资源。
  * @param {"repair"|"march"} kind 加速类型。
  * @param {number} index 当前舰队索引。
@@ -435,21 +503,20 @@ function useSpeedUpOnce(imgs, kind, index, _log) {
     if (acceleratedSegments[kind][index]) return false;
     var before = readSpeedDialog(imgs, kind, _log);
     if (!before.ok) return gh.notifyRequiredPositionMissing("城战", kind === "repair" ? "维修加速弹窗" : "行军加速弹窗", _log);
-    click(before.button.x + imgs.warSpeedUpX2.getWidth() / 2, before.button.y + imgs.warSpeedUpX2.getHeight() / 2);
-    _log("[城战] 舰队" + (index + 1) + "点击" + (kind === "repair" ? "维修" : "行军") + "速度x2，等待倒计时确认");
+    click(before.button.x + imgs.warDiamondSpeedUp.getWidth() / 2, before.button.y + imgs.warDiamondSpeedUp.getHeight() / 2);
+    _log("[城战] 舰队" + (index + 1) + "点击" + (kind === "repair" ? "维修" : "行军") + "钻石加速，等待倒计时确认");
     sleep(900);
     var after = readSpeedDialog(imgs, kind, _log);
     if (after.ok && after.seconds < before.seconds) {
         // 钻石已因倒计时缩短被确认消耗，即使随后无法关闭弹窗也不得再次点击同一段加速。
         acceleratedSegments[kind][index] = true;
-        if (!closeSpeedDialog(imgs, kind, _log)) return false;
+        if (!closeSpeedDialog(imgs, _log)) return false;
         _log("[城战] 舰队" + (index + 1) + "确认" + (kind === "repair" ? "维修" : "行军") + "加速成功");
         return true;
     }
     // 部分版本接受点击后会立即收起弹窗，标题消失可作为页面状态变化的确认。
     var title = readOcrText(SPEED_TITLE_REGION, _log, "加速后标题");
-    var expectedTitle = kind === "repair" ? "维修加速" : "加速行军";
-    if (title.ok && String(title.text || "").replace(/\s/g, "").indexOf(expectedTitle) < 0) {
+    if (title.ok && !isSpeedDialogTitle(title.text)) {
         acceleratedSegments[kind][index] = true;
         _log("[城战] 舰队" + (index + 1) + "确认" + (kind === "repair" ? "维修" : "行军") + "加速成功");
         return true;
@@ -468,15 +535,31 @@ function resetAcceleratedSegments(index) {
 }
 
 /**
+ * 逐舰队复核某类钻石加速是否由用户明确启用。
+ * 该校验位于详情箭头点击前，作为调用方条件判断之外的最后一道防线。
+ * @param {Object} plan 当前舰队冻结后的执行计划。
+ * @param {"repair"|"march"} kind 要执行的加速类型。
+ * @returns {boolean} 对应开关为 true 时返回 true。
+ */
+function isAccelerationEnabled(plan, kind) {
+    return !!plan && (kind === "repair" ? plan.repairAccelerate === true : plan.marchAccelerate === true);
+}
+
+/**
  * 点击当前舰队行的详情箭头并确认进入对应的维修或行军加速弹窗。
  * @param {Object} imgs 已加载的图片资源。
  * @param {Object} row 当前舰队行。
  * @param {"repair"|"march"} kind 已在世界地图底部舰队条确认的状态。
+ * @param {Object} plan 当前舰队冻结后的执行计划。
  * @param {number} index 当前舰队索引。
  * @param {Function} _log 城战日志回调。
  * @returns {{status: "handled"|"skip"|"failed"}} 加速结果。
  */
-function accelerateFleetStatus(imgs, row, kind, index, _log) {
+function accelerateFleetStatus(imgs, row, kind, plan, index, _log) {
+    if (!isAccelerationEnabled(plan, kind)) {
+        _log("[城战] 舰队" + (index + 1) + (kind === "repair" ? "维修" : "行军") + "加速已关闭，拒绝打开钻石加速弹窗");
+        return { status: "skip" };
+    }
     var arrow = findDetailArrow(imgs, row);
     if (!arrow) return { status: "skip" };
     click(arrow.x + imgs.warFleetDetailArrow.getWidth() / 2, arrow.y + imgs.warFleetDetailArrow.getHeight() / 2);
@@ -506,7 +589,7 @@ function processFleet(imgs, plan, index, _log) {
         return { status: "failed" };
     }
     var row = rows[index];
-    var state = getFleetState(imgs, row);
+    var state = getFleetState(row);
     if (state === "idle") {
         // 空闲代表前一段倒计时完成；新的维修或出征可再各消耗一次钻石。
         resetAcceleratedSegments(index);
@@ -518,7 +601,7 @@ function processFleet(imgs, plan, index, _log) {
         if (plan.marchAccelerate && gh.findFirst(imgs.warFleetDialogTitle, 0.8, "城战舰队选择标题")) {
             var postRows = readFleetRows(imgs);
             if (!postRows) return { status: "failed" };
-            var marchAfterDispatch = accelerateFleetStatus(imgs, postRows[index], "march", index, _log);
+            var marchAfterDispatch = accelerateFleetStatus(imgs, postRows[index], "march", plan, index, _log);
             if (marchAfterDispatch.status === "failed") return marchAfterDispatch;
         }
         return { status: "handled" };
@@ -526,12 +609,12 @@ function processFleet(imgs, plan, index, _log) {
     if (worldStatus === "march") {
         // 行军已确认时上一段维修结束；仅允许这一段行军消耗一次钻石。
         acceleratedSegments.repair[index] = false;
-        return !plan.marchAccelerate || acceleratedSegments.march[index] ? { status: "skip" } : accelerateFleetStatus(imgs, row, "march", index, _log);
+        return !plan.marchAccelerate || acceleratedSegments.march[index] ? { status: "skip" } : accelerateFleetStatus(imgs, row, "march", plan, index, _log);
     }
     if (worldStatus === "repair") {
         // 维修已确认时上一段行军结束；仅允许这一段维修消耗一次钻石。
         acceleratedSegments.march[index] = false;
-        return !plan.repairAccelerate || acceleratedSegments.repair[index] ? { status: "skip" } : accelerateFleetStatus(imgs, row, "repair", index, _log);
+        return !plan.repairAccelerate || acceleratedSegments.repair[index] ? { status: "skip" } : accelerateFleetStatus(imgs, row, "repair", plan, index, _log);
     }
     _log("[城战] 舰队" + (index + 1) + "非空闲但未确认维修或行军状态，跳过以避免误扣钻石");
     return { status: "skip" };
@@ -548,6 +631,7 @@ function processFleet(imgs, plan, index, _log) {
 war.runOnce = function(imgs, plans, uiLog, claimReward) {
     var navigate = require("./navigate.js");
     var _log = uiLog || function(message) { log(message); };
+    if (!ensureWarImages(imgs, _log)) return false;
     var plansToRun = [];
     for (var i = 0; i < FLEET_COUNT; i++) {
         var plan = readPlan(plans, i);
