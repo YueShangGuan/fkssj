@@ -179,7 +179,7 @@ assert.strictEqual(runOnce(), "failed");
 assert.deepStrictEqual(clicks, [[78, 200], [972, 491]]);
 assert.ok(logs.some(function(message) { return message.indexOf("缺少“钓鱼”") >= 0; }));
 
-// 钓鱼入口短暂缺失时，必须先缩小两次、框选并点击识别到的设施；入口仍未出现才报告入口缺位。
+// 钓鱼入口短暂缺失时，必须先缩小两次、框选并点击识别到的设施；随后强制返回并确认主界面，才能放行后续任务。
 var fishingActionImage = {
     name: "钓鱼入口",
     getWidth: function() { return 178; },
@@ -216,9 +216,9 @@ assert.strictEqual(runOnce({}, {
     gatherFishing: fishingActionImage,
     gatherFishingFacility: fishingFacilityImage,
     gatherCast: fishingCastImage
-}, warningLog), "unconfirmed");
+}, warningLog), "failed");
 // 首个低库存分类直接使用 OCR 后仍打开的资源窗，因此点击“获取”前不应出现关闭再重开的固定坐标。
-assert.deepStrictEqual(clicks, [[78, 200], [902, 671], [898, 1068], [595, 785]]);
+assert.deepStrictEqual(clicks, [[78, 200], [902, 671], [898, 1068], [595, 785], [78, 2202]]);
 assert.strictEqual(pinchCalls, 1, "前往后必须通过导航模块连续缩小两次地图");
 assert.deepStrictEqual(toastMessages, []);
 assert.deepStrictEqual(warningMessages, ["[打捞资源] 未识别到必要位置“钓鱼入口”，本轮已停止操作"]);
@@ -230,7 +230,8 @@ assert.ok(
 );
 assert.deepStrictEqual(overlayCalls, [{ point: { x: 500, y: 680 }, image: fishingFacilityImage }]);
 assert.deepStrictEqual(
-    interactionEvents.slice(-2),
+    // 入口确认失败后还会点击一次左下返回；只比较设施框选与设施中心点击这一对连续事件。
+    interactionEvents.slice(-3, -1),
     [["overlay", 500, 680], ["click", 595, 785]],
     "必须先绘制设施识别框，再点击同一模板的中心"
 );

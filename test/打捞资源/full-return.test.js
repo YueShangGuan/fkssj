@@ -13,7 +13,8 @@ var moduleSource = fs.readFileSync(sourcePath, "utf8")
     + "\nmodule.exports._returnFromFullWarehouse = returnFromFullWarehouse;"
     + "\nmodule.exports._returnToMainScene = returnToMainScene;"
     + "\nmodule.exports._enterCollection = enterCollection;"
-    + "\nmodule.exports._waitForGatherFacility = waitForGatherFacility;";
+    + "\nmodule.exports._waitForGatherFacility = waitForGatherFacility;"
+    + "\nmodule.exports._GROUPS = GROUPS;";
 var testModule = new Module(sourcePath, module);
 testModule.filename = sourcePath;
 testModule.paths = Module._nodeModulePaths(path.dirname(sourcePath));
@@ -21,10 +22,12 @@ testModule._compile(moduleSource, sourcePath);
 
 var fakeNow = 0;
 var matchSequence = [];
+var matchedImages = [];
 var clicks = [];
 var pinchCalls = 0;
 var overlayCalls = [];
 var interactionEvents = [];
+var recoveryReports = [];
 var fakeGameHelper = {
     /**
      * 记录设施框选请求，验证点击前会复用种植流程的绿色识别框。
@@ -34,6 +37,18 @@ var fakeGameHelper = {
     showOverlay: function(point, image) {
         overlayCalls.push({ point: point, image: image });
         interactionEvents.push(["overlay", point.x, point.y]);
+    },
+    /**
+     * 记录采集流程缺位时是否复用了统一的必要位置告警与回主页恢复入口。
+     * @param {string} taskName 任务名称。
+     * @param {string} positionName 未确认的必要位置。
+     * @returns {boolean} 本测试只验证调用，恢复结果由调度器的场景守卫处理。
+     */
+    reportRequiredPositionMissing: function(taskName, positionName, taskLog) {
+        recoveryReports.push([taskName, positionName]);
+        // 真实公共入口会先输出缺位证据；测试桩保留该可观测行为，避免把恢复调用误当成静默吞错。
+        if (typeof taskLog === "function") taskLog("[" + taskName + "] 未识别到必要位置“" + positionName + "”，本轮已停止操作");
+        return false;
     }
 };
 var originalLoad = Module._load;
@@ -62,10 +77,11 @@ global.images = {
     },
     /**
      * 将测试队列的坐标转换为带相似度的 matchTemplate 返回值。
-     * 坐标对象可额外携带 similarity，以验证多个拾荒动画模板会选择分数最高者。
+ * 坐标对象可额外携带 similarity，以验证每个类别只会调用其经过实机核验的设施模板。
      * @returns {{matches: Array}} 模拟的设施模板匹配结果。
      */
-    matchTemplate: function() {
+    matchTemplate: function(screen, image) {
+        matchedImages.push(image);
         var match = matchSequence.shift();
         if (!match) return { matches: [] };
         return {
@@ -112,30 +128,41 @@ assert.deepStrictEqual(
 );
 assert.strictEqual(fakeNow, 800);
 
-// 拾荒有两个动画模板；同一张截图中必须比较两者分数并选择最高者，而不是按扫描顺序或退回到坐标点击。
+// 新版钓鱼页面以右下角“自动”替代旧版“甩杆”；任一稳定页面控件命中都应确认入口已完成。
 fakeNow = 0;
-var scavengingStateOne = {
-    getWidth: function() { return 180; },
-    getHeight: function() { return 210; }
+matchSequence = [null, { x: 90, y: 100 }];
+assert.strictEqual(
+    testModule.exports._waitForFishingStarted({}, {}, function() { return false; }),
+    true
+);
+assert.strictEqual(fakeNow, 0, "新版自动按钮首帧命中即可证明已经离开设施菜单");
+
+// 拾荒泊位的小人休息和外出时画面互斥；休息状态未命中后必须改用外出状态模板，而不是回退到固定坐标。
+fakeNow = 0;
+var scavengingFacilityResting = {
+    getWidth: function() { return 190; },
+    getHeight: function() { return 140; }
 };
-var scavengingStateTwo = {
-    getWidth: function() { return 220; },
-    getHeight: function() { return 220; }
+var scavengingFacilityAway = {
+    getWidth: function() { return 80; },
+    getHeight: function() { return 120; }
 };
-matchSequence = [{ x: 240, y: 360, similarity: 0.91 }, { x: 360, y: 480, similarity: 0.97 }];
+var scavengingGroup = testModule.exports._GROUPS.filter(function(group) { return group.key === "scavenging"; })[0];
+assert.deepStrictEqual(scavengingGroup.facilityTemplates, [
+    { imageKey: "gatherScavengingFacilityStateOne", label: "拾荒设施-休息" },
+    { imageKey: "gatherScavengingFacilityStateTwo", label: "拾荒设施-外出" }
+]);
+matchedImages = [];
+matchSequence = [null, { x: 360, y: 480, similarity: 0.91 }];
 assert.deepStrictEqual(
     testModule.exports._waitForGatherFacility({
-        gatherScavengingFacilityStateOne: scavengingStateOne,
-        gatherScavengingFacilityStateTwo: scavengingStateTwo
-    }, {
-        facilityTemplates: [
-            { imageKey: "gatherScavengingFacilityStateOne", label: "拾荒设施状态一" },
-            { imageKey: "gatherScavengingFacilityStateTwo", label: "拾荒设施状态二" }
-        ]
-    }, function() { return false; }),
-    { point: { x: 360, y: 480 }, image: scavengingStateTwo, label: "拾荒设施状态二", similarity: 0.97 }
+        gatherScavengingFacilityStateOne: scavengingFacilityResting,
+        gatherScavengingFacilityStateTwo: scavengingFacilityAway
+    }, scavengingGroup, function() { return false; }),
+    { point: { x: 360, y: 480 }, image: scavengingFacilityAway, label: "拾荒设施-外出", similarity: 0.91 }
 );
-assert.strictEqual(fakeNow, 0, "同一轮应连续比对两个拾荒动画模板，不额外等待");
+assert.deepStrictEqual(matchedImages, [scavengingFacilityResting, scavengingFacilityAway], "休息状态未命中时必须顺序尝试外出状态");
+assert.strictEqual(fakeNow, 0, "外出状态首轮命中后不应额外等待或回退到坐标点击");
 
 // 识别到满仓返航后，必须点击模板中心、关闭结算层，再用主界面图标确认返回完成。
 clicks = [];
@@ -191,7 +218,7 @@ assert.strictEqual(testModule.exports._returnToMainScene(
 assert.deepStrictEqual(clicks, []);
 assert.ok(autoReturnLogs.some(function(message) { return message.indexOf("不再点击固定返回坐标") >= 0; }));
 
-// 识别到设施后必须先绘制绿色框再点击模板中心，并等待入口；若入口缺失但游戏已经回到主界面，不能补点固定左下返回坐标。
+// 识别到设施后必须先绘制绿色框再点击模板中心，并等待入口；入口缺失时即使导航图标仍可见，也必须强制返回并确认主界面。
 clicks = [];
 pinchCalls = 0;
 overlayCalls = [];
@@ -211,6 +238,7 @@ assert.deepStrictEqual(testModule.exports._enterCollection(
     { gatherFishing: {}, gatherFishingFacility: fishingFacility, baseIcon: {}, worldIcon: {} },
     {
         group: {
+            key: "fishing",
             label: "钓鱼",
             actionImage: "gatherFishing",
             facilityName: "钓鱼设施",
@@ -223,22 +251,25 @@ assert.deepStrictEqual(testModule.exports._enterCollection(
     function() {},
     false,
     fakeGameHelper
-), { entered: false, shouldContinue: false, unconfirmedEntry: true });
-assert.deepStrictEqual(clicks, [[78, 200], [902, 671], [898, 1068], [200, 280]]);
+), { entered: false, shouldContinue: false, unconfirmedEntry: false });
+assert.deepStrictEqual(clicks, [[78, 200], [902, 671], [898, 1068], [200, 280], [78, 2202]]);
 assert.strictEqual(pinchCalls, 1, "前往后必须先缩小两次地图再找设施");
 assert.deepStrictEqual(overlayCalls, [{ point: { x: 100, y: 200 }, image: fishingFacility }]);
-assert.deepStrictEqual(interactionEvents.slice(-2), [["overlay", 100, 200], ["click", 200, 280]]);
+// 未找到入口后会强制点击左下返回；断言仅覆盖设施识别框与设施中心点击的顺序。
+assert.deepStrictEqual(interactionEvents.slice(-3, -1), [["overlay", 100, 200], ["click", 200, 280]]);
 
 // 设施命中后入口也命中时，必须按“设施中心 → 入口中心”顺序完成点击并报告已进入采集页。
 clicks = [];
 pinchCalls = 0;
 overlayCalls = [];
 interactionEvents = [];
+fakeNow = 0;
 matchSequence = [{ x: 100, y: 200 }, { x: 300, y: 400 }, { x: 500, y: 600 }];
 assert.deepStrictEqual(testModule.exports._enterCollection(
     { gatherFishing: fishingFacility, gatherFishingFacility: fishingFacility, gatherCast: {}, baseIcon: {}, worldIcon: {} },
     {
         group: {
+            key: "fishing",
             label: "钓鱼",
             actionImage: "gatherFishing",
             facilityName: "钓鱼设施",
@@ -257,14 +288,17 @@ assert.strictEqual(pinchCalls, 1);
 assert.deepStrictEqual(overlayCalls, [{ point: { x: 100, y: 200 }, image: fishingFacility }]);
 // 成功路径最后还会点击采集入口，因此取倒数第三、倒数第二项核对设施框选与设施点击的先后。
 assert.deepStrictEqual(interactionEvents.slice(-3, -1), [["overlay", 100, 200], ["click", 200, 280]]);
+assert.strictEqual(fakeNow, 8000, "设施选中后必须等待详情卡进入可交互状态，再识别并点击钓鱼入口");
 
 // 钓鱼入口点击后必须看到“甩杆”状态；设施菜单仍显示入口时不能直接开始固定时长等待。
 clicks = [];
 pinchCalls = 0;
 overlayCalls = [];
 interactionEvents = [];
+recoveryReports = [];
 matchSequence = [{ x: 100, y: 200 }, { x: 300, y: 400 }];
 for (var fishingStartAttempt = 0; fishingStartAttempt < 15; fishingStartAttempt++) matchSequence.push(null);
+matchSequence.push({ x: 4, y: 8 });
 assert.deepStrictEqual(testModule.exports._enterCollection(
     { gatherFishing: fishingFacility, gatherFishingFacility: fishingFacility, gatherCast: {}, baseIcon: {}, worldIcon: {} },
     {
@@ -282,9 +316,10 @@ assert.deepStrictEqual(testModule.exports._enterCollection(
     function() {},
     true,
     fakeGameHelper
-), { entered: false, shouldContinue: false, unconfirmedEntry: true });
-assert.deepStrictEqual(clicks, [[902, 671], [898, 1068], [200, 280], [400, 480]]);
+), { entered: false, shouldContinue: false, unconfirmedEntry: false });
+assert.deepStrictEqual(clicks, [[902, 671], [898, 1068], [200, 280], [400, 480], [78, 2202]]);
 assert.strictEqual(pinchCalls, 1);
+assert.deepStrictEqual(recoveryReports, [["打捞资源", "钓鱼开始状态"]], "钓鱼页未确认时必须触发既有通用回主页恢复入口");
 
 // 下潜设施缺失时必须只报告安全失败，不能点击白色手势或旧地图固定点来碰运气。
 clicks = [];
@@ -311,11 +346,39 @@ assert.deepStrictEqual(testModule.exports._enterCollection(
     function(message) { facilityFailureLogs.push(message); },
     false,
     fakeGameHelper
-), { entered: false, shouldContinue: false });
+), { entered: false, shouldContinue: false, unconfirmedEntry: false });
 assert.deepStrictEqual(clicks, [[78, 200], [902, 1351], [898, 1068]]);
 assert.strictEqual(pinchCalls, 1);
 assert.deepStrictEqual(overlayCalls, []);
 assert.ok(facilityFailureLogs.some(function(message) { return message.indexOf("下潜设施") >= 0; }));
+
+// 地图上未识别到设施且返回后仍无法确认主界面时，必须把失败升级为未确认，禁止调度器继续点击其他任务。
+clicks = [];
+pinchCalls = 0;
+overlayCalls = [];
+interactionEvents = [];
+matchSequence = [];
+assert.deepStrictEqual(testModule.exports._enterCollection(
+    { gatherSalvage: {}, gatherSalvageFacility: {}, baseIcon: {}, worldIcon: {} },
+    {
+        group: {
+            key: "salvage",
+            label: "打捞",
+            actionImage: "gatherSalvage",
+            facilityName: "下潜设施",
+            facilityTemplates: [{ imageKey: "gatherSalvageFacility", label: "下潜设施" }]
+        },
+        stock: { getButton: [902, 1351] }
+    },
+    { x: 1, y: 1 },
+    function() { return false; },
+    function() {},
+    false,
+    fakeGameHelper
+), { entered: false, shouldContinue: false, unconfirmedEntry: true });
+assert.deepStrictEqual(clicks, [[78, 200], [902, 1351], [898, 1068], [78, 2202]]);
+assert.strictEqual(pinchCalls, 1);
+assert.deepStrictEqual(overlayCalls, []);
 
 // 没有出现“恭喜获得”时不能直接认定已回到主界面，留给下轮安全重试。
 clicks = [];

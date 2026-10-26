@@ -1,4 +1,4 @@
-// resourceGather.js — 资源库存检查与钓鱼、拾荒、打捞流程
+// resourceGather.js — 资源库存检查与钓鱼、拾荒、深潜流程
 
 var resourceGather = {};
 
@@ -10,9 +10,13 @@ var REWARD_CLOSE_HINT_RETRY_DELAY_MS = 400;
 // “前往”后的资源入口会经过地图转场；只轮询已裁取的入口模板，避免首帧尚未绘制就错误返回主界面。
 var COLLECTION_ENTRY_ATTEMPTS = 10;
 var COLLECTION_ENTRY_RETRY_DELAY_MS = 400;
-// 点击钓鱼入口后必须看到钓鱼页的“甩杆”控件，不能把设施菜单仍停留在屏幕上的状态当作已进入采集。
+// 点击钓鱼入口后必须看到旧版“甩杆”或新版“自动”控件，不能把设施菜单仍停留在屏幕上的状态当作已进入采集。
 var FISHING_START_ATTEMPTS = 15;
 var FISHING_START_RETRY_DELAY_MS = 400;
+// 点击入口后先留出完整的页面转场时间，再开始识图，避免首帧仍是设施菜单时留下误导性未确认记录。
+var FISHING_PAGE_SETTLE_DELAY_MS = 1200;
+// 设施详情卡会先完成缩放和按钮入场；实机 800ms 虽可截图看到按钮，但触控尚可能被动画吞掉。
+var FACILITY_ACTION_SETTLE_DELAY_MS = 1800;
 // “前往”后的镜头会受设备初始缩放影响；缩小两次后才用同一组设施模板进行有限轮询。
 var GATHER_FACILITY_ATTEMPTS = 10;
 var GATHER_FACILITY_RETRY_DELAY_MS = 400;
@@ -20,7 +24,8 @@ var GATHER_FACILITY_RETRY_DELAY_MS = 400;
 var GATHER_FACILITY_THRESHOLD = 0.9;
 
 // 资源储量弹窗固定在 1080×2400 游戏画面内；库存数值区域只包含“当前/上限”，避免 OCR 将资源名称混入数字。
-// 坐标已按 2026-10-15 目标设备原始 1080×2400 截图标定，资源行顺序必须和弹窗视觉顺序一致。
+// 坐标已按 2026-10-15 目标设备原始 1080×2400 截图标定。
+// 三类流程按弹窗视觉顺序隔离：第 1 行仅钓鱼、第 2–4 行仅拾荒、第 5–7 行仅深潜；不能按低库存资源的相邻行复用设施模板。
 var RESOURCE_ROWS = [
     { name: "鱼", group: "fishing", stockRegion: [570, 570, 230, 65], getButton: [902, 671] },
     { name: "塑料", group: "scavenging", stockRegion: [570, 740, 230, 65], getButton: [902, 842] },
@@ -45,15 +50,15 @@ var GROUPS = [
         actionImage: "gatherScavenging",
         fullReturnImage: "gatherScavengingFullReturn",
         facilityName: "拾荒设施",
-        // 拾荒船有两个动画外观；任一稳定模板命中即可进入同一设施。
+        // 同一拾荒泊位会在小人休息和外出时呈现互斥画面；休息图缺失后才尝试外出图，二者命中均可打开“拾荒”入口。
         facilityTemplates: [
-            { imageKey: "gatherScavengingFacilityStateOne", label: "拾荒设施状态一" },
-            { imageKey: "gatherScavengingFacilityStateTwo", label: "拾荒设施状态二" }
+            { imageKey: "gatherScavengingFacilityStateOne", label: "拾荒设施-休息" },
+            { imageKey: "gatherScavengingFacilityStateTwo", label: "拾荒设施-外出" }
         ]
     },
     {
         key: "salvage",
-        label: "打捞",
+        label: "深潜",
         actionImage: "gatherSalvage",
         fullReturnImage: "gatherSalvageFullReturn",
         facilityName: "下潜设施",
@@ -228,16 +233,18 @@ function waitForCollectionEntry(actionImage, shouldStop) {
 
 /**
  * 确认点击钓鱼入口后已经进入可操作的钓鱼页面。
- * 设施菜单中的“钓鱼”按钮仍可能可见但点击未被游戏接受；只有钓鱼页的“甩杆”控件出现才允许开始计时。
+ * 设施菜单中的“钓鱼”按钮仍可能可见但点击未被游戏接受；旧版以“甩杆”、新版以“自动”控件作为页面进入判据。
  * @param {Object} castImage “甩杆”按钮的原始模板。
+ * @param {Object} autoImage 新版钓鱼页“自动”按钮的原始模板。
  * @param {Function} shouldStop 停止标记。
  * @returns {boolean} 已识别到钓鱼页面时返回 true；超时、缺图或停止时返回 false。
  */
-function waitForFishingStarted(castImage, shouldStop) {
-    if (!castImage) return false;
+function waitForFishingStarted(castImage, autoImage, shouldStop) {
+    if (!castImage && !autoImage) return false;
     for (var attempt = 0; attempt < FISHING_START_ATTEMPTS; attempt++) {
         if (shouldStop()) return false;
-        if (findTemplateQuietly(castImage, 0.8)) return true;
+        // “自动”在普通钓鱼期间会常驻，因此只能作为入口成功判据，不能复用于不限时结束检测。
+        if (findTemplateQuietly(castImage, 0.8) || findTemplateQuietly(autoImage, 0.8)) return true;
         if (attempt < FISHING_START_ATTEMPTS - 1) sleep(FISHING_START_RETRY_DELAY_MS);
     }
     return false;
@@ -245,7 +252,7 @@ function waitForFishingStarted(castImage, shouldStop) {
 
 /**
  * 判断本类别是否至少有一张可用的设施模板。
- * 拾荒允许其中一个动画状态模板暂时缺失；其余类别必须存在自己的设施主体，不能退回到白色手势或固定地图坐标。
+ * 拾荒的动画状态模板允许个别缺失，但至少需要一张同一浮台的实机模板；其余类别必须存在自己的设施主体，不能退回到白色手势或固定地图坐标。
  * @param {Object} imgs 已加载的图片资源。
  * @param {Object} group 当前资源类别配置。
  * @returns {boolean} 至少存在一张可用于识别的设施模板时返回 true。
@@ -259,43 +266,115 @@ function hasGatherFacilityTemplate(imgs, group) {
 }
 
 /**
- * 在一张截图中按类别模板识别相似度最高的资源设施。
- * 同一次截图复用给所有候选模板；跨模板选择最高相似度，避免先扫描到的相似码头覆盖真实设施。
+ * 在一张截图中按类别配置的顺序识别资源设施。
+ * 拾荒的状态模板彼此互斥，必须先确认休息状态不存在才检查外出状态，避免把两种画面混作同一候选集。
  * @param {Object} imgs 已加载的图片资源。
  * @param {Object} group 当前资源类别配置。
- * @returns {{point: {x: number, y: number}, image: Object, label: string, similarity: number}|null} 匹配到的设施及模板信息；未命中时返回 null。
+ * @returns {{point: {x: number, y: number}, image: Object, label: string, similarity: number}|{rejected: boolean, label: string, conflictingGroupLabel: string, conflictingFacilityLabel: string}|null} 已确认的设施、跨类别冲突或未命中。
  */
 function findGatherFacility(imgs, group) {
     var templates = group.facilityTemplates || [];
     if (typeof images.matchTemplate !== "function") return null;
     var screen = captureScreen();
     try {
-        var bestFacility = null;
         for (var i = 0; i < templates.length; i++) {
             var template = templates[i];
             var image = imgs[template.imageKey];
             if (!image) continue;
-            var matchingResult = images.matchTemplate(screen, image, {
-                threshold: GATHER_FACILITY_THRESHOLD,
-                max: 10
-            });
-            var matches = matchingResult && matchingResult.matches ? matchingResult.matches : [];
-            for (var j = 0; j < matches.length; j++) {
-                var match = matches[j];
-                if (!bestFacility || match.similarity > bestFacility.similarity) {
-                    bestFacility = {
-                        point: { x: match.point.x, y: match.point.y },
-                        image: image,
+            var bestMatch = findHighestTemplateMatch(screen, image);
+            if (bestMatch) {
+                // 同一状态图可能在画面中出现多个候选，只点击该状态下置信度最高的目标；后续状态只处理本状态完全缺失。
+                var facility = {
+                    point: { x: bestMatch.point.x, y: bestMatch.point.y },
+                    image: image,
+                    label: template.label,
+                    similarity: bestMatch.similarity
+                };
+                var conflict = findConflictingFacility(screen, imgs, group, facility);
+                if (conflict) {
+                    // 三种资源设施在地图上相邻且下潜模板曾与拾荒浮台重叠；同帧出现交叉命中时宁可停止，不能把“获取”的类别丢给相邻设施。
+                    return {
+                        rejected: true,
                         label: template.label,
-                        similarity: match.similarity
+                        conflictingGroupLabel: conflict.groupLabel,
+                        conflictingFacilityLabel: conflict.facilityLabel
                     };
                 }
+                return facility;
             }
         }
-        return bestFacility;
+        return null;
     } finally {
         try { if (screen && screen.recycle) screen.recycle(); } catch (e) {}
     }
+}
+
+/**
+ * 在当前截图中取得单张设施模板置信度最高的匹配。
+ * 同一类别可能有多个同类浮台，选择最高置信度后仍会经过跨类别隔离检查，避免“最像”被误当作“正确类别”。
+ * @param {Object} screen 当前游戏截图。
+ * @param {Object} image 待匹配的设施模板。
+ * @returns {{point: {x: number, y: number}, similarity: number}|null} 最高置信度匹配；无匹配时返回 null。
+ */
+function findHighestTemplateMatch(screen, image) {
+    var matchingResult = images.matchTemplate(screen, image, {
+        threshold: GATHER_FACILITY_THRESHOLD,
+        max: 10
+    });
+    var matches = matchingResult && matchingResult.matches ? matchingResult.matches : [];
+    var bestMatch = null;
+    for (var i = 0; i < matches.length; i++) {
+        var match = matches[i];
+        if (!bestMatch || match.similarity > bestMatch.similarity) bestMatch = match;
+    }
+    return bestMatch;
+}
+
+/**
+ * 判断两个类别的模板候选是否覆盖同一地图设施。
+ * 模板裁剪大小不同，不能只比较左上角；矩形相交才说明两张图可能在描述同一处目标。
+ * @param {{x: number, y: number}} firstPoint 第一张模板的左上角。
+ * @param {Object} firstImage 第一张模板图片。
+ * @param {{x: number, y: number}} secondPoint 第二张模板的左上角。
+ * @param {Object} secondImage 第二张模板图片。
+ * @returns {boolean} 两张模板覆盖区域相交时返回 true。
+ */
+function templatesOverlap(firstPoint, firstImage, secondPoint, secondImage) {
+    var firstRight = firstPoint.x + firstImage.getWidth();
+    var firstBottom = firstPoint.y + firstImage.getHeight();
+    var secondRight = secondPoint.x + secondImage.getWidth();
+    var secondBottom = secondPoint.y + secondImage.getHeight();
+    return firstPoint.x < secondRight
+        && firstRight > secondPoint.x
+        && firstPoint.y < secondBottom
+        && firstBottom > secondPoint.y;
+}
+
+/**
+ * 查找与当前候选重叠的其他资源类别设施。
+ * 每次类别执行只允许点击自己的设施模板；若当前帧的钓鱼、拾荒或深潜模板互相覆盖，返回冲突而不是以相邻浮台作为兜底。
+ * @param {Object} screen 当前游戏截图。
+ * @param {Object} imgs 已加载的图片资源。
+ * @param {Object} group 当前资源类别配置。
+ * @param {{point: {x: number, y: number}, image: Object}} facility 当前类别候选。
+ * @returns {{groupLabel: string, facilityLabel: string}|null} 重叠的其他类别模板信息；无冲突时返回 null。
+ */
+function findConflictingFacility(screen, imgs, group, facility) {
+    for (var groupIndex = 0; groupIndex < GROUPS.length; groupIndex++) {
+        var otherGroup = GROUPS[groupIndex];
+        if (otherGroup.key === group.key) continue;
+        var templates = otherGroup.facilityTemplates || [];
+        for (var templateIndex = 0; templateIndex < templates.length; templateIndex++) {
+            var template = templates[templateIndex];
+            var otherImage = imgs[template.imageKey];
+            if (!otherImage) continue;
+            var otherMatch = findHighestTemplateMatch(screen, otherImage);
+            if (otherMatch && templatesOverlap(facility.point, facility.image, otherMatch.point, otherImage)) {
+                return { groupLabel: otherGroup.label, facilityLabel: template.label };
+            }
+        }
+    }
+    return null;
 }
 
 /**
@@ -304,16 +383,18 @@ function findGatherFacility(imgs, group) {
  * @param {Object} imgs 已加载的图片资源。
  * @param {Object} group 当前资源类别配置。
  * @param {Function} shouldStop 停止标记。
- * @returns {{point: {x: number, y: number}, image: Object, label: string, similarity: number}|null} 已确认的设施及模板信息；超时或停止时返回 null。
+ * @returns {{point: {x: number, y: number}, image: Object, label: string, similarity: number}|{rejected: boolean, label: string, conflictingGroupLabel: string, conflictingFacilityLabel: string}|null} 已确认设施、最后一次跨类别冲突或超时/停止。
  */
 function waitForGatherFacility(imgs, group, shouldStop) {
+    var lastRejectedFacility = null;
     for (var attempt = 0; attempt < GATHER_FACILITY_ATTEMPTS; attempt++) {
         if (shouldStop()) return null;
         var facility = findGatherFacility(imgs, group);
-        if (facility) return facility;
+        if (facility && !facility.rejected) return facility;
+        if (facility && facility.rejected) lastRejectedFacility = facility;
         if (attempt < GATHER_FACILITY_ATTEMPTS - 1) sleep(GATHER_FACILITY_RETRY_DELAY_MS);
     }
-    return null;
+    return lastRejectedFacility;
 }
 
 /**
@@ -343,9 +424,15 @@ function notifyNotMainScene(uiLog) {
  * 缺位发生后调度器仍可能继续检查其他任务，系统 Toast 会遮住主界面模板，因此只写结构化告警而不弹出覆盖层。
  * @param {string} positionName 未识别到的位置名称。
  * @param {Function} uiLog 调度器日志回调。
+ * @param {Object} [gameHelper] 已加载的公共工具；存在时复用其必要位置告警和通用回主页恢复。
  * @returns {false} 恒为 false，供安全失败分支直接返回。
  */
-function notifyRequiredPositionMissing(positionName, uiLog) {
+function notifyRequiredPositionMissing(positionName, uiLog, gameHelper) {
+    if (gameHelper && typeof gameHelper.reportRequiredPositionMissing === "function") {
+        // 恢复成功也不能继续使用本次采集前保存的截图状态，当前类别仍由调用方安全结束。
+        gameHelper.reportRequiredPositionMissing("打捞资源", positionName, uiLog);
+        return false;
+    }
     var message = "[打捞资源] 未识别到必要位置“" + positionName + "”，本轮已停止操作";
     if (typeof uiLog === "function" && typeof uiLog.appendWarning === "function") uiLog.appendWarning(message);
     else uiLog(message);
@@ -400,11 +487,20 @@ function enterCollection(imgs, selection, scale, shouldStop, uiLog, isResourceWi
 
     var facility = waitForGatherFacility(imgs, selection.group, shouldStop);
     if (shouldStop()) return { entered: false, shouldContinue: false };
+    if (facility && facility.rejected) {
+        // 本轮“获取”已经明确属于当前类别；候选同时命中其他类别时绝不复用其设施入口，避免深潜被带到拾荒浮台。
+        uiLog(
+            "[打捞资源] 已拒绝“" + selection.group.label + "”设施候选（模板: " + facility.label
+            + "；与“" + facility.conflictingGroupLabel + "”的“" + facility.conflictingFacilityLabel + "”重叠）"
+        );
+        facility = null;
+    }
     if (!facility) {
-        notifyRequiredPositionMissing(selection.group.facilityName, uiLog);
-        // “前往”已离开基地时只允许使用当前流程已验证的返回键，不能以旧地图坐标继续猜测设施位置。
-        if (!isMainScene(imgs)) clickFixedPoint(FIXED_POINTS.returnButton, scale);
-        return { entered: false, shouldContinue: false };
+        // “前往”后的地图本身可能已经是世界主界面，故不强制点击返回；统一通过回主页方法确认，避免遗漏确认失败后仍放行后续任务。
+        var returnedToMainAfterFacilityFailure = returnToMainScene(imgs, scale, uiLog);
+        notifyRequiredPositionMissing(selection.group.facilityName, uiLog, gameHelper);
+        // 已确认主界面才允许调度器继续其他任务；确认失败时保留安全截断，避免后续点击落到未知页面。
+        return { entered: false, shouldContinue: false, unconfirmedEntry: !returnedToMainAfterFacilityFailure };
     }
     // 与种植土地识别一致，先用同一张命中模板绘制非触控绿色框，再点击其中心，便于现场核对实际识别目标。
     gameHelper.showOverlay(facility.point, facility.image);
@@ -418,24 +514,28 @@ function enterCollection(imgs, selection, scale, shouldStop, uiLog, isResourceWi
         + "（模板: " + facility.label + "；相似度: " + facilitySimilarity
         + "；中心: " + facilityCenterX + "," + facilityCenterY + "）"
     );
-    sleep(800);
+    // 详情卡首帧可提前显示“钓鱼”等按钮模板，但动画未结束时点击会被游戏吞掉；先等待其进入可交互状态。
+    sleep(FACILITY_ACTION_SETTLE_DELAY_MS);
     var actionPoint = waitForCollectionEntry(actionImage, shouldStop);
     if (shouldStop()) return { entered: false, shouldContinue: false };
     if (!actionPoint) {
-        notifyRequiredPositionMissing(selection.group.label + "入口", uiLog);
-        // 已离开基地而未找到入口时也要回退，避免下轮重试从地图页误点资源条。
-        // 满仓无收获时游戏可能已经自动回到主界面；此时继续点固定坐标会落在主界面其他控件上。
-        if (!isMainScene(imgs)) clickFixedPoint(FIXED_POINTS.returnButton, scale);
-        // 设施菜单会保留基地/世界图标，单靠主界面图标无法证明菜单已关闭；通知调度器暂停本轮，不能带着该菜单继续其他任务。
-        return { entered: false, shouldContinue: false, unconfirmedEntry: true };
+        // 已确认进入设施详情后，即使基地/世界图标仍可见也不能把它当作主界面；必须执行采集页的返回流程。
+        var returnedToMain = returnToMainScene(imgs, scale, uiLog, true);
+        notifyRequiredPositionMissing(selection.group.label + "入口", uiLog, gameHelper);
+        // 返回成功后本次采集仍记为失败，但调度器可在已确认主界面上继续后续任务；失败才要求其阻断本轮。
+        return { entered: false, shouldContinue: false, unconfirmedEntry: !returnedToMain };
     }
     clickTemplateCenter(actionPoint, actionImage);
     if (selection.group.key === "fishing") {
         uiLog("[打捞资源] 已点击钓鱼入口，等待确认钓鱼页面");
-        if (!waitForFishingStarted(imgs.gatherCast, shouldStop)) {
-            notifyRequiredPositionMissing("钓鱼开始状态", uiLog);
-            // 入口按钮可能因点击失效仍停在设施菜单；交给调度器阻断本轮，不能直接进入固定时长等待。
-            return { entered: false, shouldContinue: false, unconfirmedEntry: true };
+        // 现场转场可能晚于点击事件提交；等待结束后以旧版“甩杆”或新版“自动”模板确认已进入钓鱼页。
+        sleep(FISHING_PAGE_SETTLE_DELAY_MS);
+        if (!waitForFishingStarted(imgs.gatherCast, imgs.gatherFishingAuto, shouldStop)) {
+            if (shouldStop()) return { entered: false, shouldContinue: false };
+            // 已点击钓鱼入口却未见钓鱼页时，优先复用采集场景的返回和确认，而非把后续任务留在设施菜单上。
+            var returnedAfterFishingFailure = returnToMainScene(imgs, scale, uiLog, true);
+            notifyRequiredPositionMissing("钓鱼开始状态", uiLog, gameHelper);
+            return { entered: false, shouldContinue: false, unconfirmedEntry: !returnedAfterFishingFailure };
         }
         uiLog("[打捞资源] 已确认进入钓鱼页面");
     }
@@ -465,11 +565,12 @@ function confirmMainScene(imgs, uiLog) {
  * @param {Object} imgs 已加载的图片资源。
  * @param {{x: number, y: number}} scale 当前缩放比例。
  * @param {Function} uiLog 日志回调。
+ * @param {boolean} [forceReturn=false] 已确认仍在采集/设施页时强制点击返回，避免残留导航图标伪装成主界面。
  * @returns {boolean} 是否确认已回到主界面。
  */
-function returnToMainScene(imgs, scale, uiLog) {
-    // 打捞满仓且本轮无收获时，游戏会自行直返主界面；不得再点击旧采集页的固定返回坐标。
-    if (isMainScene(imgs)) {
+function returnToMainScene(imgs, scale, uiLog, forceReturn) {
+    // 打捞满仓且本轮无收获时，游戏会自行直返主界面；仅在未确认采集页上下文时才允许跳过固定返回坐标。
+    if (!forceReturn && isMainScene(imgs)) {
         uiLog("[打捞资源] 已自动回到主界面，不再点击固定返回坐标");
         return true;
     }
@@ -617,14 +718,19 @@ function runCollectionGroup(imgs, selection, durationMinutes, scale, shouldStop,
         uiLog("[打捞资源] 缺少“" + selection.group.facilityName + "”原始截图模板，本轮不执行");
         return { completed: false, resourceWindowOpen: isResourceWindowOpen };
     }
-    if (selection.group.key === "fishing" && !imgs.gatherCast) {
-        // 固定时长与不限时钓鱼都以“甩杆”确认真正进入钓鱼页，缺图时不能盲等并把设施菜单留在前台。
-        uiLog("[打捞资源] 缺少“甩杆”模板，无法确认钓鱼已开始");
+    if (selection.group.key === "fishing" && !imgs.gatherCast && !imgs.gatherFishingAuto) {
+        // 至少要有一种版本的页面控件才能确认已离开设施菜单，不能盲等并把菜单留在前台。
+        uiLog("[打捞资源] 缺少“甩杆/自动”模板，无法确认钓鱼已开始");
+        return { completed: false, resourceWindowOpen: isResourceWindowOpen };
+    }
+    if (selection.group.key === "fishing" && durationMinutes === null && !imgs.gatherCast) {
+        // “自动”会在新版钓鱼期间持续显示，不能据此判断不限时已满仓；没有旧版甩杆状态时拒绝进入无限等待。
+        uiLog("[打捞资源] 不限时钓鱼缺少“甩杆”满仓状态模板，本轮不执行");
         return { completed: false, resourceWindowOpen: isResourceWindowOpen };
     }
     var entryResult = enterCollection(imgs, selection, scale, shouldStop, uiLog, isResourceWindowOpen, gameHelper);
     if (!entryResult.entered) {
-        // 把设施菜单未确认状态继续上传给总调度，避免它仅凭残留的主界面图标切换到下一个任务。
+        // 把设施菜单未确认状态上传给总调度；统一场景守卫必须先确认或恢复主页，才能继续后续任务。
         return { completed: false, resourceWindowOpen: false, unconfirmedEntry: !!entryResult.unconfirmedEntry };
     }
 
