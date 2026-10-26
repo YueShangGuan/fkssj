@@ -98,6 +98,21 @@ function Resolve-MuMuSerial {
 
 <#
 .SYNOPSIS
+    Converts an ADB serial into a safe Windows directory-name segment.
+
+.DESCRIPTION
+    TCP ADB serials include a colon (for example, 127.0.0.1:7555), which Windows
+    rejects in a path segment. The raw serial remains in the log metadata while
+    this value is used only for the local diagnostic-snapshot directory.
+#>
+function ConvertTo-SafePathSegment {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    return $Value -replace '[<>:"/\\|?*]', '_'
+}
+
+<#
+.SYNOPSIS
     Lists the durable runtime-log files on one emulator in newest-first order.
 #>
 function Get-RemoteRuntimeLogNames {
@@ -224,7 +239,9 @@ if ($sessionLogNames.Count -eq 0) {
 }
 
 $pullTimestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$destinationDirectory = Join-Path $LocalLogRoot "$deviceSerial-$sessionPrefix-$pullTimestamp"
+# TCP serials cannot be used verbatim as Windows directory names; keep the device identity in the tail-file metadata.
+$localDeviceSegment = ConvertTo-SafePathSegment -Value $deviceSerial
+$destinationDirectory = Join-Path $LocalLogRoot "$localDeviceSegment-$sessionPrefix-$pullTimestamp"
 New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
 
 foreach ($remoteName in $sessionFileNames) {
