@@ -4,12 +4,25 @@ var fleet = {};
 
 var gh = require("./gameHelper.js");
 
+/**
+ * 在舰队选择页确认至少存在一支空闲舰队。
+ * 商船夺回重试没有空闲舰队时必须跳过，不能把出征点击到驻守或行军中的舰队上。
+ * @param {Object} imgs 已加载的图片资源。
+ * @param {number} [threshold] 模板相似度阈值。
+ * @returns {{x: number, y: number}|null} 空闲标记位置；未识别到时返回 null。
+ */
 fleet.isIdle = function(imgs, threshold) {
     var pos = gh.findFirst(imgs.fleetIdle, threshold || 0.7, "空闲中");
     if (pos) console.log("检测到空闲舰队: (" + pos.x + ", " + pos.y + ")");
     return pos;
 };
 
+/**
+ * 勾选舰队选择页内所有可选的未勾选舰队。
+ * @param {Object} imgs 已加载的图片资源。
+ * @param {number} [threshold] 模板相似度阈值。
+ * @returns {number} 本轮实际勾选的舰队数量。
+ */
 fleet.selectUnchecked = function(imgs, threshold) {
     var unchecked = gh.findAll(imgs.fleetUnchecked, threshold || 0.7, "未勾选");
     console.log("未勾选舰队: " + unchecked.length + " 个");
