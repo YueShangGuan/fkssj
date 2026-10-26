@@ -52,6 +52,8 @@ gameHelper.loadImages = function() {
         },
         liandao: images.read("./img/镰刀.png"),
         tudi: images.read("./img/土地.png"),
+        // 未完工建筑地块也会包含土地纹理；弹层中的蓝图图标按 1080×2400 设备截图尺寸保存，供种植在首次点按后确认负向状态。
+        constructionBlueprint: images.read("./img/建筑蓝图-弹层.png"),
         stockFull: images.read("./img/该农作物库存已达上限.png"),
         duanzao: images.read("./img/锻造/开始锻造.png"),
         duanzaoDone: images.read("./img/锻造/锻造完成.png"),
@@ -95,11 +97,14 @@ gameHelper.loadImages = function() {
         // 搁浅商船
         shipIcon: images.read("./img/搁浅商船/图标.png"),
         shipLarge: images.read("./img/搁浅商船/万吨商轮.png"),
+        // 提前准备期只打开活动弹窗；整点通过此稳定按钮进入货轮列表，避免再点击货轮卡片延误出征。
+        shipCargoList: images.read("./img/搁浅商船/货轮列表.png"),
         shipInList: images.read("./img/搁浅商船/万吨货轮在列表.png"),
         shipGoBtn: images.read("./img/搁浅商船/前往按钮.png"),
         shipCloseList: images.read("./img/搁浅商船/关闭货轮列表.png"),
         shipClosePage: images.read("./img/搁浅商船/关闭搁浅商船页面.png"),
-        // 贸易港口
+        // 贸易港口；居民需求头像会随当前首位居民变化，residentDemand.js 复用此图未受绿色勾影响的上半部，
+        // 再按已校准的相对位置点击其下方居民槽位，避免将单一头像误当作通用入口。
         tradePortEntry: images.read("./img/贸易港口/入口.png"),
         tradePortReceive: images.read("./img/贸易港口/收货.png"),
         tradePortRewardTitle: images.read("./img/贸易港口/恭喜获得.png"),
@@ -107,6 +112,12 @@ gameHelper.loadImages = function() {
         tradePortInsufficient: images.read("./img/贸易港口/所需产品不足.png"),
         tradePortInsufficientClose: images.read("./img/贸易港口/所需产品不足关闭.png"),
         tradePortClose: images.read("./img/贸易港口/关闭.png"),
+        // “立即完成”只用于识别协商中，residentDemand.js 明确禁止点击该模板。
+        residentDemandPanel: images.read("./img/居民需求/面板标识.png"),
+        residentDemandSatisfy: images.read("./img/居民需求/满足TA.png"),
+        residentDemandRefresh: images.read("./img/居民需求/刷新.png"),
+        residentDemandImmediateComplete: images.read("./img/居民需求/立即完成.png"),
+        residentDemandBack: images.read("./img/居民需求/返回.png"),
         // 展区：全部从 MuMu 原始 1080×2400 截图裁取；地点名称由 exhibition.js 使用 OCR 二次确认，图钉只负责打开详情。
         exhibitionMuseum: images.read("./img/展区/博物馆.png"),
         exhibitionBubble: images.read("./img/展区/展品气泡.png"),
@@ -159,16 +170,29 @@ gameHelper.loadImages = function() {
         gatherScavenging: readOptionalImage("./img/打捞资源/拾荒.png"),
         gatherSalvage: readOptionalImage("./img/打捞资源/打捞.png"),
         gatherFishingFacility: readOptionalImage("./img/打捞资源/钓鱼设施.png"),
+        // 拾荒设施会在小人休息或外出时切换外观；两张模板均从“前往 → 双指缩小两次”后的同一设备画面裁取。
         gatherScavengingFacilityStateOne: readOptionalImage("./img/打捞资源/拾荒设施-状态一.png"),
         gatherScavengingFacilityStateTwo: readOptionalImage("./img/打捞资源/拾荒设施-状态二.png"),
         gatherSalvageFacility: readOptionalImage("./img/打捞资源/下潜设施.png"),
+        // 甩杆模板只保留按钮内部的稳定图案和文字，排除钓鱼场景的动态水面及设施背景。
         gatherCast: readOptionalImage("./img/打捞资源/甩杆.png"),
+        // 新版钓鱼页没有“甩杆”控件，会持续显示右下角“自动”按钮；它仅用于确认已离开设施菜单。
+        gatherFishingAuto: readOptionalImage("./img/打捞资源/自动钓鱼.png"),
         // 不限时拾荒/打捞满仓后显示专属返航按钮；未提供原始截图时对应类别必须安全跳过。
         gatherScavengingFullReturn: readOptionalImage("./img/打捞资源/拾荒满仓返航.png"),
         gatherSalvageFullReturn: readOptionalImage("./img/打捞资源/打捞满仓返航.png"),
+        // 资源收集：模板仅保留会左右摆动的气泡本体和内部图标，不包含周围建筑，避免缩放地图后受建筑背景干扰。
+        resourceExperienceSea: readOptionalImage("./img/资源收集/海兽经验.png"),
+        resourceExperienceEquipment: readOptionalImage("./img/资源收集/装备经验.png"),
+        resourceExperienceHero: readOptionalImage("./img/资源收集/英雄经验.png"),
+        resourceFactoryBrick: readOptionalImage("./img/资源收集/工厂-砖块.png"),
+        resourceFactoryNecklace: readOptionalImage("./img/资源收集/工厂-饰品.png"),
+        resourceFactoryCrate: readOptionalImage("./img/资源收集/工厂-货箱.png"),
         // 通用导航
         // 全屏奖励弹层完全展开后才出现，用作所有任务关闭奖励前的安全前置条件。
         rewardDismissHint: images.read("./img/通用/点击空白区域关闭.png"),
+        // 通用返回模板从目标 MuMu 的生产设施弹层裁取，仅包含红色箭头按钮主体；未知弹层恢复时以它作为最后一个已识别的退出入口。
+        genericBack: images.read("./img/通用/通用返回.png"),
         baseIcon: images.read("./img/通用/基地.png"),
         worldIcon: images.read("./img/通用/世界.png"),
         forgeHouse: images.read("./img/通用/锻造屋.png"),
@@ -204,9 +228,10 @@ gameHelper.findAndClick = function(targetImage, threshold, name) {
  * @param {Object} targetImage 已加载的模板图片。
  * @param {number|string} [threshold] 图片相似度；第二参数为名称时使用默认值。
  * @param {string} [name] 日志中使用的图片名称。
+ * @param {boolean} [silent=false] 未匹配是否静默；仅适用于互斥状态等预期缺失的模板。
  * @returns {{x: number, y: number}|null} 模板左上角坐标；未匹配时返回 null。
  */
-gameHelper.findFirst = function(targetImage, threshold, name) {
+gameHelper.findFirst = function(targetImage, threshold, name, silent) {
     if (typeof threshold === "string") { name = threshold; threshold = 0.7; }
     var screen = captureScreen();
     var result;
@@ -226,7 +251,8 @@ gameHelper.findFirst = function(targetImage, threshold, name) {
             y: result.y
         };
     }
-    console.error("未找到图片" + tag);
+    // 互斥按钮的正常缺失不是识图故障，调用方可显式静默以保留真正的异常告警。
+    if (!silent) console.error("未找到图片" + tag);
     return null;
 };
 

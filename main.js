@@ -17,7 +17,9 @@ var schedulerRunning = false;
 var schedulerSessionId = 0;
 var selectedFood = foodOptions[0];
 var harvestStats = floatingPanel.stats;
-var icoBitmap = images.read("./ico.png").getBitmap();
+// 悬浮球由异步 Canvas 绘制；保留 Image 源对象的生命周期，避免其 Bitmap 在首次绘制前被 AutoJs 回收。
+var icoImage = images.read("./ico.png");
+var icoBitmap = icoImage.getBitmap();
 
 function dp(v) { return Math.round(v * context.getResources().getDisplayMetrics().density); }
 
@@ -83,6 +85,14 @@ $ui.layout(
                                     </vertical>
                                 </card>
                             </horizontal>
+
+                            <text text="任务状态" textColor={C.textMuted} textSize="13sp" textStyle="bold" padding="20 12 10 16"/>
+                            <card w="*" cardCornerRadius="10dp" cardElevation="0dp" cardBackgroundColor={C.card} margin="16 0 16 0">
+                                <horizontal gravity="center_vertical" padding="12 10">
+                                    <text text="居民需求" textColor={C.textSecondary} textSize="13sp" layout_weight="1"/>
+                                    <text id="home_resident_demand_status" text={floatingPanel.getResidentDemandStatusText()} textColor={C.green} textSize="13sp" textStyle="bold"/>
+                                </horizontal>
+                            </card>
 
                             {/* Device info */}
                             <text text="设备信息" textColor={C.textMuted} textSize="13sp" textStyle="bold" padding="20 14 10 12"/>
@@ -202,8 +212,29 @@ var panelCtx = {
     onStop: function() { stopScheduler(); }
 };
 
+/**
+ * 将本地持久化的居民需求每日状态同步到脚本主页与当前悬浮面板。
+ * 任务结果可从调度线程回调，因此所有主页控件更新必须回到 UI 线程。
+ */
+function refreshResidentDemandHomeStatus() {
+    var status = floatingPanel.getResidentDemandStatusText();
+    $ui.run(function() {
+        try { $ui.home_resident_demand_status.setText(status); } catch(e) {}
+    });
+    floatingPanel.refreshResidentDemandStatus();
+}
+
+/**
+ * 依据当前设备本地日期刷新居民需求状态。
+ * 完成日期保留在本地配置中作审计，跨零点只重算展示，不能把“昨日已完成”继续显示为今天完成。
+ */
+function refreshResidentDemandDateStatus() {
+    refreshResidentDemandHomeStatus();
+}
+
 // ── Init stats display & resolution ──
 uiHelpers.initStats(harvestStats);
+refreshResidentDemandDateStatus();
 try {
     var res = gameHelper.getRealResolution();
     var rw = res[0], rh = res[1];
@@ -251,6 +282,8 @@ function checkPerms() {
 }
 checkPerms();
 setInterval(function() { checkPerms(); }, 3000);
+// 不依赖总调度是否正在运行：跨零点后的首页和悬浮面板都应及时按完成日期重算为“今日未完成”。
+setInterval(function() { refreshResidentDemandDateStatus(); }, 60000);
 
 // 点击权限行跳转对应设置
 $ui.perm_pkg_list_row.on("click", function() {
@@ -296,6 +329,9 @@ function startScheduler() {
         return false;
     }
 
+    // 启动前先按今天重算状态，避免调度刚开始时主页仍展示昨天的“今日已完成”。
+    refreshResidentDemandDateStatus();
+
     var sessionId = ++schedulerSessionId;
     schedulerRunning = true;
     floatingPanel.running = true;
@@ -333,7 +369,9 @@ function startScheduler() {
                     harvestStats[taskKey] = (harvestStats[taskKey] || 0) + 1;
                     uiHelpers.updateStats(taskKey, harvestStats);
                     floatingPanel._saveConfig();
-                }
+                },
+                // 居民需求的“已完成”与巡检时间不属于累计统计，落库后只刷新两处状态标记。
+                onResidentDemandStateChange: function() { refreshResidentDemandHomeStatus(); }
             });
         } catch(e) {
             // 顶层调度异常需要保留堆栈和现场截图，供宿主机拉回后与业务日志一起分析。

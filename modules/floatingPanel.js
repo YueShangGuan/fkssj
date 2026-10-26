@@ -56,6 +56,45 @@ function normalizeWarFleetPlans(source) {
     return plans;
 }
 
+/**
+ * 将毫秒时间戳转换为设备本地日期键，居民需求的每日状态不能依赖宿主机日期。
+ * @param {number} timestamp 毫秒时间戳。
+ * @returns {string|null} 本地日期键；无效时间戳返回 null。
+ */
+function getLocalDateKey(timestamp) {
+    if (typeof timestamp !== "number" || !isFinite(timestamp) || timestamp <= 0) return null;
+    var date = new Date(timestamp);
+    if (isNaN(date.getTime())) return null;
+    var month = date.getMonth() + 1;
+    var day = date.getDate();
+    return date.getFullYear() + "-" + (month < 10 ? "0" : "") + month + "-" + (day < 10 ? "0" : "") + day;
+}
+
+/**
+ * 判断持久化字符串是否为真实存在的本地日历日期键。
+ * 居民需求的每日完成状态以业务日期存储；损坏的值必须按未完成处理，不能跨日误跳过任务。
+ * @param {*} value 待校验的日期键。
+ * @returns {boolean} 仅 `YYYY-MM-DD` 且对应真实日历日期时返回 true。
+ */
+function isLocalDateKey(value) {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    var parts = value.split("-");
+    var year = Number(parts[0]);
+    var month = Number(parts[1]);
+    var day = Number(parts[2]);
+    var date = new Date(year, month - 1, day);
+    return date.getFullYear() === year && date.getMonth() === month - 1 && date.getDate() === day;
+}
+
+/**
+ * 判断持久化的居民需求数值配置是否为正整数。
+ * @param {*} value 待校验的本地配置值。
+ * @returns {boolean} 仅有效正整数返回 true。
+ */
+function isPositiveInteger(value) {
+    return typeof value === "number" && isFinite(value) && value > 0 && Math.floor(value) === value;
+}
+
 // 状态存储在模块上，避免跨上下文丢失
 panel.selectedFood = "";
 panel.warFleetPlans = createDefaultWarFleetPlans();
@@ -68,10 +107,23 @@ panel.runCount = 0;
 // null 表示总调度页；详情页状态只在当前打开的面板实例内保留。
 panel.activeTaskDetail = null;
 panel._ballPos = null;
-panel.freq = { food: 30, weapon: 30, ship: 60, war: 20, tradePort: 10, exhibition: 10, intelligence: 4, hangUpReward: 1 };
+panel.freq = { food: 30, weapon: 30, war: 20, tradePort: 10, residentDemand: 10, exhibition: 10, intelligence: 4, hangUpReward: 1, resourceExperience: 10, resourceFactory: 10 };
+// 商船在整点前进入活动弹窗，默认预留 1 分钟；该值不属于普通任务完成后的轮询间隔。
+panel.shipPrepareMinutes = 1;
+// 货轮仍在列表时默认每分钟重走一轮商船流程；该值仅在下一次启动总调度器时生效。
+panel.shipRetryMinutes = 1;
 panel.stats = { food: 0, weapon: 0, ship: 0, war: 0 };
-panel.taskEnabled = { food: false, weapon: false, ship: false, war: false, tradePort: false, gather: false, exhibition: false, intelligence: false, hangUpReward: false };
+panel.taskEnabled = { food: false, weapon: false, ship: false, war: false, tradePort: false, gather: false, residentDemand: false, exhibition: false, intelligence: false, resourceCollection: false };
+// 资源收集组默认勾选全部子功能；外层总开关仍默认关闭，避免脚本升级后直接触发游戏操作。
+panel.resourceCollection = { hangUpReward: true, experience: true, factory: true };
 panel.tradePortLastCompletedAt = 0;
+// 居民需求只在确认返回基地后写入；巡检时间和 YYYY-MM-DD 完成日期分别保存，跨零点时以完成日期重新判断今日状态。
+panel.residentDemandLastCheckedAt = 0;
+panel.residentDemandCompletedDate = "";
+// 奖励阈值独立持久化；周四金币模式默认关闭，避免升级后改变既有经验判断。
+panel.residentDemandExperienceThreshold = 500;
+panel.residentDemandThursdayGoldEnabled = false;
+panel.residentDemandGoldThreshold = 2000;
 panel.gatherIntervalMinutes = 60;
 panel.gatherThresholdPercent = 90;
 panel.gatherDurationMinutes = 5;
@@ -81,6 +133,57 @@ panel.exhibitionSites = EXHIBITION_SITE_OPTIONS.map(function(option) { return op
 // 情报仅在奖励关闭、气泡处理完且安全回到基地后才更新，重启脚本仍会遵守完成后间隔。
 panel.intelligenceLastCompletedAt = 0;
 panel.schedulerStatus = "请选择要调度的任务";
+
+/**
+ * 判断居民需求是否已在当前设备本地日期完成。
+ * 已完成日期保留用于审计；每次展示和调度都直接与今天比较，不依赖跨零点定时器清除内存状态。
+ * @param {number} [now] 当前设备毫秒时间戳；未传入时使用当前时间。
+ * @returns {boolean} 完成日期就是今天时返回 true。
+ */
+panel.isResidentDemandCompletedToday = function(now) {
+    var current = typeof now === "number" ? now : Date.now();
+    return isLocalDateKey(panel.residentDemandCompletedDate) && panel.residentDemandCompletedDate === getLocalDateKey(current);
+};
+
+/**
+ * 返回居民需求今日状态的只读文案，供主页和悬浮面板使用。
+ * @param {number} [now] 当前设备毫秒时间戳；未传入时使用当前时间。
+ * @returns {string} “今日已完成”或“今日未完成”。
+ */
+panel.getResidentDemandStatusText = function(now) {
+    return panel.isResidentDemandCompletedToday(now) ? "今日已完成" : "今日未完成";
+};
+
+/**
+ * 刷新悬浮面板中居民需求的状态标记。页面可能已经折叠，因此保留状态字段并仅更新当前存在的控件。
+ * @param {number} [now] 当前设备毫秒时间戳；测试或跨日刷新时可显式指定。
+ * @returns {string} 刷新后的今日状态文案。
+ */
+panel.refreshResidentDemandStatus = function(now) {
+    var text = panel.getResidentDemandStatusText(now);
+    if (typeof $ui === "undefined" || typeof $ui.run !== "function") return text;
+    $ui.run(function() {
+        try { if (floatWin && floatWin.scheduler_resident_demand_state) floatWin.scheduler_resident_demand_state.setText(text); } catch(e) {}
+        try { if (floatWin && floatWin.resident_demand_status_detail) floatWin.resident_demand_status_detail.setText(text); } catch(e) {}
+    });
+    return text;
+};
+
+/**
+ * 记录居民需求模块在安全返回基地后的巡检结果并一次性持久化。
+ * @param {{lastCheckedAt:number,completedDate?:string}} state 模块回调的已确认状态。
+ * @returns {boolean} 状态有效并已保存时返回 true。
+ */
+panel.applyResidentDemandSafeCheck = function(state) {
+    if (!state || typeof state.lastCheckedAt !== "number" || !isFinite(state.lastCheckedAt) || state.lastCheckedAt <= 0) return false;
+    panel.residentDemandLastCheckedAt = state.lastCheckedAt;
+    // 完成日期由居民模块按巡检开始日期计算；仅终态并安全返回基地后才允许覆盖本地记录。
+    if (isLocalDateKey(state.completedDate)) panel.residentDemandCompletedDate = state.completedDate;
+    // 回调只来自居民模块已确认返回基地的边界，避免停止、协商中或未知页面提前持久化。
+    panel._saveConfig();
+    panel.refreshResidentDemandStatus();
+    return true;
+};
 
 // 从本地存储恢复配置
 /**
@@ -100,9 +203,12 @@ panel._loadConfig = function() {
             if (cfg.freq) {
                 if (cfg.freq.food) panel.freq.food = cfg.freq.food;
                 if (cfg.freq.weapon) panel.freq.weapon = cfg.freq.weapon;
-                if (cfg.freq.ship) panel.freq.ship = cfg.freq.ship;
                 if (cfg.freq.war) panel.freq.war = cfg.freq.war;
                 if (cfg.freq.tradePort) panel.freq.tradePort = cfg.freq.tradePort;
+                // 居民需求巡检按分钟计且只接受正整数，损坏配置不能突破默认 10 分钟冷却。
+                if (typeof cfg.freq.residentDemand === "number" && isFinite(cfg.freq.residentDemand) && cfg.freq.residentDemand > 0 && Math.floor(cfg.freq.residentDemand) === cfg.freq.residentDemand) {
+                    panel.freq.residentDemand = cfg.freq.residentDemand;
+                }
                 if (cfg.freq.exhibition) panel.freq.exhibition = cfg.freq.exhibition;
                 if (typeof cfg.freq.intelligence === "number" && isFinite(cfg.freq.intelligence) && cfg.freq.intelligence > 0 && Math.floor(cfg.freq.intelligence) === cfg.freq.intelligence) {
                     panel.freq.intelligence = cfg.freq.intelligence;
@@ -111,8 +217,30 @@ panel._loadConfig = function() {
                 if (typeof cfg.freq.hangUpReward === "number" && isFinite(cfg.freq.hangUpReward) && cfg.freq.hangUpReward > 0 && Math.floor(cfg.freq.hangUpReward) === cfg.freq.hangUpReward) {
                     panel.freq.hangUpReward = cfg.freq.hangUpReward;
                 }
+                // 两类地图气泡均以分钟冷却，损坏配置不能覆盖默认 10 分钟。
+                if (typeof cfg.freq.resourceExperience === "number" && isFinite(cfg.freq.resourceExperience) && cfg.freq.resourceExperience > 0 && Math.floor(cfg.freq.resourceExperience) === cfg.freq.resourceExperience) {
+                    panel.freq.resourceExperience = cfg.freq.resourceExperience;
+                }
+                if (typeof cfg.freq.resourceFactory === "number" && isFinite(cfg.freq.resourceFactory) && cfg.freq.resourceFactory > 0 && Math.floor(cfg.freq.resourceFactory) === cfg.freq.resourceFactory) {
+                    panel.freq.resourceFactory = cfg.freq.resourceFactory;
+                }
+            }
+            // 提前进入时间直接影响整点抢占边界，损坏、小数或非正值不能覆盖默认 1 分钟。
+            if (typeof cfg.shipPrepareMinutes === "number" && isFinite(cfg.shipPrepareMinutes) && cfg.shipPrepareMinutes > 0 && Math.floor(cfg.shipPrepareMinutes) === cfg.shipPrepareMinutes) {
+                panel.shipPrepareMinutes = cfg.shipPrepareMinutes;
+            }
+            // 夺回重试与提前进入都影响限时边界，损坏、小数或非正值不能覆盖默认 1 分钟。
+            if (typeof cfg.shipRetryMinutes === "number" && isFinite(cfg.shipRetryMinutes) && cfg.shipRetryMinutes > 0 && Math.floor(cfg.shipRetryMinutes) === cfg.shipRetryMinutes) {
+                panel.shipRetryMinutes = cfg.shipRetryMinutes;
             }
             if (typeof cfg.tradePortLastCompletedAt === "number") panel.tradePortLastCompletedAt = cfg.tradePortLastCompletedAt;
+            if (typeof cfg.residentDemandLastCheckedAt === "number") panel.residentDemandLastCheckedAt = cfg.residentDemandLastCheckedAt;
+            // 只读取新日期字段，不把旧时间戳当作本日完成，升级后会在下一次真实安全巡检写入标准日期。
+            if (isLocalDateKey(cfg.residentDemandCompletedDate)) panel.residentDemandCompletedDate = cfg.residentDemandCompletedDate;
+            // 缺失或损坏的新增阈值保持初始化默认值，不能从其他任务配置推断或复用。
+            if (isPositiveInteger(cfg.residentDemandExperienceThreshold)) panel.residentDemandExperienceThreshold = cfg.residentDemandExperienceThreshold;
+            if (typeof cfg.residentDemandThursdayGoldEnabled === "boolean") panel.residentDemandThursdayGoldEnabled = cfg.residentDemandThursdayGoldEnabled;
+            if (isPositiveInteger(cfg.residentDemandGoldThreshold)) panel.residentDemandGoldThreshold = cfg.residentDemandGoldThreshold;
             if (typeof cfg.gatherIntervalMinutes === "number" && cfg.gatherIntervalMinutes > 0) panel.gatherIntervalMinutes = cfg.gatherIntervalMinutes;
             if (typeof cfg.gatherThresholdPercent === "number" && cfg.gatherThresholdPercent >= 1 && cfg.gatherThresholdPercent <= 100) panel.gatherThresholdPercent = cfg.gatherThresholdPercent;
             // null 明确表示不限时；旧配置缺少字段时继续使用默认 5 分钟。
@@ -130,8 +258,13 @@ panel._loadConfig = function() {
             }
             if (cfg.ballPos) panel._ballPos = cfg.ballPos;
             if (cfg.stats) panel.stats = cfg.stats;
+            if (cfg.resourceCollection) {
+                ["hangUpReward", "experience", "factory"].forEach(function(key) {
+                    if (typeof cfg.resourceCollection[key] === "boolean") panel.resourceCollection[key] = cfg.resourceCollection[key];
+                });
+            }
             if (cfg.taskEnabled) {
-                ["food", "weapon", "ship", "war", "tradePort", "gather", "exhibition", "intelligence", "hangUpReward"].forEach(function(key) {
+                ["food", "weapon", "ship", "war", "tradePort", "gather", "residentDemand", "exhibition", "intelligence", "resourceCollection"].forEach(function(key) {
                     if (typeof cfg.taskEnabled[key] === "boolean") panel.taskEnabled[key] = cfg.taskEnabled[key];
                 });
             }
@@ -152,8 +285,19 @@ panel._saveConfig = function() {
             weaponLevel: panel.weaponLevel,
             weaponFridayOnly: panel.weaponFridayOnly,
             freq: panel.freq,
+            // 商船需要在整点前打开活动弹窗，此配置以分钟保存且不与普通任务秒级间隔混用。
+            shipPrepareMinutes: panel.shipPrepareMinutes,
+            // 货轮仍在列表时按此分钟值重新进入活动夺回；运行中使用启动快照避免改变当前时段计划。
+            shipRetryMinutes: panel.shipRetryMinutes,
             // 仅在贸易港口已确认关闭后更新，确保重启后仍遵守完成后间隔。
             tradePortLastCompletedAt: panel.tradePortLastCompletedAt,
+            // 居民需求的巡检和完成日期只由安全回到基地后的回调写入；展示与调度实时比较完成日期和今天。
+            residentDemandLastCheckedAt: panel.residentDemandLastCheckedAt,
+            residentDemandCompletedDate: panel.residentDemandCompletedDate,
+            // 奖励判断由居民模块按设备本地星期使用，三个字段必须成组保存，避免下次启动退回隐式固定阈值。
+            residentDemandExperienceThreshold: panel.residentDemandExperienceThreshold,
+            residentDemandThursdayGoldEnabled: panel.residentDemandThursdayGoldEnabled,
+            residentDemandGoldThreshold: panel.residentDemandGoldThreshold,
             gatherIntervalMinutes: panel.gatherIntervalMinutes,
             gatherThresholdPercent: panel.gatherThresholdPercent,
             // null 代表不限时，不能将其与旧配置缺失合并处理。
@@ -164,6 +308,8 @@ panel._saveConfig = function() {
             exhibitionSites: panel.exhibitionSites,
             // 情报只由 intelligence.runOnce 的安全完成回调更新，不能在中断时提前写入。
             intelligenceLastCompletedAt: panel.intelligenceLastCompletedAt,
+            // 三个子功能开关与频率会跨重启保留；完成时间只由 scheduler 在本次会话内维护。
+            resourceCollection: panel.resourceCollection,
             ballPos: panel._ballPos,
             stats: panel.stats,
             taskEnabled: panel.taskEnabled
@@ -195,9 +341,10 @@ var TASK_DETAIL_PAGES = [
     { key: "food", title: "种植" },
     { key: "gather", title: "打捞资源" },
     { key: "tradePort", title: "贸易港口" },
+    { key: "residentDemand", title: "居民需求" },
     { key: "exhibition", title: "展区" },
     { key: "intelligence", title: "情报" },
-    { key: "hangUpReward", title: "挂机奖励" },
+    { key: "resourceCollection", title: "资源收集" },
     { key: "ship", title: "商船" },
     { key: "war", title: "盟战" }
 ];
@@ -384,6 +531,14 @@ panel.expandPanel = function(ctx) {
                             </card>
                             <card w="*" h="auto" cardCornerRadius="9dp" cardElevation="0dp" cardBackgroundColor="#D7DAE0" padding="1" margin="0 0 0 6">
                                 <horizontal gravity="center_vertical" bg="#FFFFFF" padding="4 2">
+                                    <checkbox id="scheduler_cb_residentDemand" text="居民需求" textSize="13sp" textColor="#1C1C1E" layout_weight="1"/>
+                                    <text id="scheduler_resident_demand_state" text={panel.getResidentDemandStatusText()} textColor="#5D7A5B" textSize="10sp" margin="0 0 6 0"/>
+                                    <card id="scheduler_freq_residentDemand" h="34dp" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFF3F7" foreground="?selectableItemBackground" padding="10 6"><text id="scheduler_freq_residentDemand_t" text={panel.freq.residentDemand + "分"} textColor="#A04468" textSize="13sp" gravity="center"/></card>
+                                    <card id="scheduler_detail_residentDemand" w="34dp" h="34dp" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFF3F7" foreground="?selectableItemBackground" margin="6 0 0 0"><text text=">" textColor="#A04468" textSize="18sp" gravity="center" textStyle="bold"/></card>
+                                </horizontal>
+                            </card>
+                            <card w="*" h="auto" cardCornerRadius="9dp" cardElevation="0dp" cardBackgroundColor="#D7DAE0" padding="1" margin="0 0 0 6">
+                                <horizontal gravity="center_vertical" bg="#FFFFFF" padding="4 2">
                                     <checkbox id="scheduler_cb_exhibition" text="展区" textSize="13sp" textColor="#1C1C1E" layout_weight="1"/>
                                     <card id="scheduler_freq_exhibition" h="34dp" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFF3F7" foreground="?selectableItemBackground" padding="10 6"><text id="scheduler_freq_exhibition_t" text={panel.freq.exhibition + "分"} textColor="#A04468" textSize="13sp" gravity="center"/></card>
                                     <card id="scheduler_detail_exhibition" w="34dp" h="34dp" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFF3F7" foreground="?selectableItemBackground" margin="6 0 0 0"><text text=">" textColor="#A04468" textSize="18sp" gravity="center" textStyle="bold"/></card>
@@ -398,15 +553,15 @@ panel.expandPanel = function(ctx) {
                             </card>
                             <card w="*" h="auto" cardCornerRadius="9dp" cardElevation="0dp" cardBackgroundColor="#D7DAE0" padding="1" margin="0 0 0 6">
                                 <horizontal gravity="center_vertical" bg="#FFFFFF" padding="4 2">
-                                    <checkbox id="scheduler_cb_hangUpReward" text="挂机奖励" textSize="13sp" textColor="#1C1C1E" layout_weight="1"/>
-                                    <card id="scheduler_freq_hangUpReward" h="34dp" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFF3F7" foreground="?selectableItemBackground" padding="10 6"><text id="scheduler_freq_hangUpReward_t" text={panel.freq.hangUpReward + "小时"} textColor="#A04468" textSize="13sp" gravity="center"/></card>
-                                    <card id="scheduler_detail_hangUpReward" w="34dp" h="34dp" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFF3F7" foreground="?selectableItemBackground" margin="6 0 0 0"><text text=">" textColor="#A04468" textSize="18sp" gravity="center" textStyle="bold"/></card>
+                                    <checkbox id="scheduler_cb_resourceCollection" text="资源收集" textSize="13sp" textColor="#1C1C1E" layout_weight="1"/>
+                                    <card id="scheduler_freq_resourceCollection" h="34dp" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFF3F7" foreground="?selectableItemBackground" padding="10 6"><text id="scheduler_freq_resourceCollection_t" text="3 项" textColor="#A04468" textSize="13sp" gravity="center"/></card>
+                                    <card id="scheduler_detail_resourceCollection" w="34dp" h="34dp" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFF3F7" foreground="?selectableItemBackground" margin="6 0 0 0"><text text=">" textColor="#A04468" textSize="18sp" gravity="center" textStyle="bold"/></card>
                                 </horizontal>
                             </card>
                             <card w="*" h="auto" cardCornerRadius="9dp" cardElevation="0dp" cardBackgroundColor="#D7DAE0" padding="1" margin="0 0 0 6">
                                 <horizontal gravity="center_vertical" bg="#FFFFFF" padding="4 2">
-                                    <checkbox id="scheduler_cb_ship" text="商船 · 整点抢占" textSize="13sp" textColor="#1C1C1E" layout_weight="1"/>
-                                    <card id="scheduler_freq_ship" h="34dp" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFF3F7" foreground="?selectableItemBackground" padding="10 6"><text id="scheduler_freq_ship_t" text={panel.freq.ship + "s"} textColor="#A04468" textSize="13sp" gravity="center"/></card>
+                                    <checkbox id="scheduler_cb_ship" text="商船 · 提前准备" textSize="13sp" textColor="#1C1C1E" layout_weight="1"/>
+                                    <card id="scheduler_freq_ship" h="34dp" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFF3F7" foreground="?selectableItemBackground" padding="10 6"><text id="scheduler_freq_ship_t" text={"备" + panel.shipPrepareMinutes + " / 重" + panel.shipRetryMinutes + "分"} textColor="#A04468" textSize="13sp" gravity="center"/></card>
                                     <card id="scheduler_detail_ship" w="34dp" h="34dp" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFF3F7" foreground="?selectableItemBackground" margin="6 0 0 0"><text text=">" textColor="#A04468" textSize="18sp" gravity="center" textStyle="bold"/></card>
                                 </horizontal>
                             </card>
@@ -418,7 +573,7 @@ panel.expandPanel = function(ctx) {
                                 </horizontal>
                             </card>
                         </vertical>
-                        <text text="普通任务固定按“锻造 → 种植 → 打捞资源 → 贸易港口 → 展区 → 情报 → 挂机奖励”执行；冷却只跳过自身。" textColor="#8E8E93" textSize="10sp" margin="2 8 0 0"/>
+                        <text text="普通任务固定按“锻造 → 种植 → 打捞资源 → 贸易港口 → 居民需求 → 展区 → 情报 → 资源收集”执行；冷却只跳过自身。" textColor="#8E8E93" textSize="10sp" margin="2 8 0 0"/>
                     </vertical>
                     <vertical id="set_food" w="*" margin="0 0 0 0">
                         <text text="作物" textColor="#8E8E93" textSize="11sp" margin="0 0 6 0"/>
@@ -502,6 +657,29 @@ panel.expandPanel = function(ctx) {
                             </card>
                         </horizontal>
                     </vertical>
+                    <vertical id="set_residentDemand" w="*" visibility="gone" margin="0 0 0 0">
+                        <text text="居民每天会提出物资需求。当前奖励严格高于对应阈值且物资足够时自动满足；等于或低于阈值会刷新，物资不足则跳过等待后续补齐。" textColor="#8E8E93" textSize="12sp" margin="0 0 0 8"/>
+                        <text text="默认按经验判断；开启周四按金币判断后，仅设备本地周四读取金币，其余日期仍按经验。" textColor="#C7C7CC" textSize="10sp" margin="0 0 0 8"/>
+                        <text text="刷新后游戏会自动切换下一位居民；最后一位进入协商中时只退出巡检，绝不点击“立即完成”。" textColor="#C7C7CC" textSize="10sp" margin="0 0 0 10"/>
+                        <horizontal gravity="center_vertical" margin="0 0 0 8">
+                            <text text="状态" textColor="#8E8E93" textSize="12sp" layout_weight="1"/>
+                            <text id="resident_demand_status_detail" text={panel.getResidentDemandStatusText()} textColor="#5D7A5B" textSize="15sp" textStyle="bold"/>
+                        </horizontal>
+                        <horizontal gravity="center_vertical">
+                            <text text="巡检间隔" textColor="#8E8E93" textSize="12sp" layout_weight="1"/>
+                            <card id="freq_residentDemand_btn" w="auto" h="auto" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFFFFF" padding="12 9" foreground="?selectableItemBackground"><text id="freq_residentDemand_t" text={panel.freq.residentDemand + " 分钟"} textColor="#1C1C1E" textSize="15sp"/></card>
+                        </horizontal>
+                        <horizontal gravity="center_vertical" margin="0 8 0 0">
+                            <text text="经验阈值" textColor="#8E8E93" textSize="12sp" layout_weight="1"/>
+                            <card id="resident_demand_experience_threshold_btn" w="auto" h="auto" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFFFFF" padding="12 9" foreground="?selectableItemBackground"><text id="resident_demand_experience_threshold_t" text={panel.residentDemandExperienceThreshold + ""} textColor="#1C1C1E" textSize="15sp"/></card>
+                        </horizontal>
+                        <checkbox id="resident_demand_thursday_gold_enabled" text="周四按金币判断" textSize="13sp" textColor="#1C1C1E" margin="0 8 0 0"/>
+                        <horizontal gravity="center_vertical">
+                            <text text="金币阈值" textColor="#8E8E93" textSize="12sp" layout_weight="1"/>
+                            <card id="resident_demand_gold_threshold_btn" w="auto" h="auto" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFFFFF" padding="12 9" foreground="?selectableItemBackground"><text id="resident_demand_gold_threshold_t" text={panel.residentDemandGoldThreshold + ""} textColor="#1C1C1E" textSize="15sp"/></card>
+                        </horizontal>
+                        <text text="金币阈值始终可预设，仅在开启上方开关且设备本地周四生效。" textColor="#C7C7CC" textSize="10sp" margin="0 5 0 0"/>
+                    </vertical>
                     <vertical id="set_gather" w="*" visibility="gone" margin="0 0 0 0">
                         <text text="游戏生产需要使用一些资源，从固定入口获取，一般是钓鱼、拾荒、打捞。" textColor="#8E8E93" textSize="12sp" margin="0 0 0 10"/>
                         <text text="库存低于阈值时按钓鱼、拾荒、打捞各执行一次；不限时仅自动执行钓鱼。" textColor="#C7C7CC" textSize="10sp" margin="0 0 0 10"/>
@@ -551,25 +729,50 @@ panel.expandPanel = function(ctx) {
                             <card id="freq_intelligence_btn" w="auto" h="auto" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFFFFF" padding="12 9" foreground="?selectableItemBackground"><text id="freq_intelligence_t" text={panel.freq.intelligence + " 小时"} textColor="#1C1C1E" textSize="15sp"/></card>
                         </horizontal>
                     </vertical>
-                    <vertical id="set_hangUpReward" w="*" visibility="gone" margin="0 0 0 0">
-                        <text text="闯关界面的挂机奖励最多可存储 10 小时。开启后会进入闯关界面领取奖励并返回主界面，避免奖励溢出。" textColor="#8E8E93" textSize="12sp" margin="0 0 0 8"/>
-                        <text text="完成后的间隔只在本次总调度运行中生效；停止并重启脚本后会重新尝试领取。" textColor="#C7C7CC" textSize="10sp" margin="0 0 0 10"/>
-                        <horizontal gravity="center_vertical">
-                            <text text="完成后间隔" textColor="#8E8E93" textSize="12sp" layout_weight="1"/>
-                            <card id="freq_hangUpReward_btn" w="auto" h="auto" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFFFFF" padding="12 9" foreground="?selectableItemBackground"><text id="freq_hangUpReward_t" text={panel.freq.hangUpReward + " 小时"} textColor="#1C1C1E" textSize="15sp"/></card>
-                        </horizontal>
+                    <vertical id="set_resourceCollection" w="*" visibility="gone" margin="0 0 0 0">
+                        <text text="按勾选的功能定时领取挂机奖励、经验气泡和工厂物资。未发现资源时会经锻造坊返回并缩小地图后再检查。" textColor="#8E8E93" textSize="12sp" margin="0 0 0 8"/>
+                        <text text="三个功能的完成时间只在本次总调度运行中生效；停止并重启脚本后会重新检查。" textColor="#C7C7CC" textSize="10sp" margin="0 0 0 10"/>
+                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#F5F5F5" padding="10 7" margin="0 0 0 7">
+                            <horizontal gravity="center_vertical">
+                                <checkbox id="resource_collection_hang_up" text="挂机奖励" textSize="13sp" textColor="#1C1C1E" layout_weight="1"/>
+                                <text text="间隔时间" textColor="#8E8E93" textSize="11sp" margin="0 0 7 0"/>
+                                <card id="freq_hangUpReward_btn" w="auto" h="auto" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFFFFF" padding="10 7" foreground="?selectableItemBackground"><text id="freq_hangUpReward_t" text={panel.freq.hangUpReward + " 小时"} textColor="#1C1C1E" textSize="14sp"/></card>
+                            </horizontal>
+                        </card>
+                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#F5F5F5" padding="10 7" margin="0 0 0 7">
+                            <horizontal gravity="center_vertical">
+                                <checkbox id="resource_collection_experience" text="收集资源" textSize="13sp" textColor="#1C1C1E" layout_weight="1"/>
+                                <text text="间隔时间" textColor="#8E8E93" textSize="11sp" margin="0 0 7 0"/>
+                                <card id="freq_resourceExperience_btn" w="auto" h="auto" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFFFFF" padding="10 7" foreground="?selectableItemBackground"><text id="freq_resourceExperience_t" text={panel.freq.resourceExperience + " 分钟"} textColor="#1C1C1E" textSize="14sp"/></card>
+                            </horizontal>
+                        </card>
+                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#F5F5F5" padding="10 7">
+                            <horizontal gravity="center_vertical">
+                                <checkbox id="resource_collection_factory" text="工厂生产收集" textSize="13sp" textColor="#1C1C1E" layout_weight="1"/>
+                                <text text="间隔时间" textColor="#8E8E93" textSize="11sp" margin="0 0 7 0"/>
+                                <card id="freq_resourceFactory_btn" w="auto" h="auto" cardCornerRadius="8dp" cardElevation="0dp" cardBackgroundColor="#FFFFFF" padding="10 7" foreground="?selectableItemBackground"><text id="freq_resourceFactory_t" text={panel.freq.resourceFactory + " 分钟"} textColor="#1C1C1E" textSize="14sp"/></card>
+                            </horizontal>
+                        </card>
                     </vertical>
                     <vertical id="set_ship" w="*" visibility="gone" margin="0 0 0 0">
                         <horizontal gravity="center_vertical" margin="0 0 6 0">
-                            <text text="8:00-22:00" textColor="#C7C7CC" textSize="10sp"/>
+                            <text text="8:00-19:00；20:00-21:00 盟战优先" textColor="#C7C7CC" textSize="10sp"/>
                         </horizontal>
-                        <text text="开启总调度后，每个整点检查一次；盟战期间会自动延后补执行。" textColor="#8E8E93" textSize="12sp" margin="0 0 0 8"/>
+                        <text text="提前进入“搁浅的货轮”活动弹窗；整点立即出征。货轮仍在列表时按重试间隔重新夺回，货轮消失则等待下一整点。准备期会暂停其他任务。" textColor="#8E8E93" textSize="12sp" margin="0 0 0 8"/>
                         <horizontal gravity="center_vertical">
-                            <text text="频率" textColor="#8E8E93" textSize="12sp"/>
-                            <card id="freq_ship_btn" w="auto" h="auto" cardCornerRadius="8dp" cardElevation="0dp"
+                            <text text="提前进入" textColor="#8E8E93" textSize="12sp"/>
+                            <card id="ship_prepare_minutes_btn" w="auto" h="auto" cardCornerRadius="8dp" cardElevation="0dp"
                                   cardBackgroundColor="#FFFFFF" padding="14 12" margin="12 0 0 0"
                                   foreground="?selectableItemBackground">
-                                <text id="freq_ship_t" text={panel.freq.ship + "s"} textColor="#1C1C1E" textSize="18sp"/>
+                                <text id="ship_prepare_minutes_t" text={panel.shipPrepareMinutes + " 分钟"} textColor="#1C1C1E" textSize="18sp"/>
+                            </card>
+                        </horizontal>
+                        <horizontal gravity="center_vertical" margin="0 10 0 0">
+                            <text text="夺回重试间隔" textColor="#8E8E93" textSize="12sp"/>
+                            <card id="ship_retry_minutes_btn" w="auto" h="auto" cardCornerRadius="8dp" cardElevation="0dp"
+                                  cardBackgroundColor="#FFFFFF" padding="14 12" margin="12 0 0 0"
+                                  foreground="?selectableItemBackground">
+                                <text id="ship_retry_minutes_t" text={panel.shipRetryMinutes + " 分钟"} textColor="#1C1C1E" textSize="18sp"/>
                             </card>
                         </horizontal>
                     </vertical>
@@ -691,14 +894,18 @@ panel.expandPanel = function(ctx) {
     // checkbox 颜色
     try { floatWin.war_reward_cb.setButtonTintList(csl); } catch(e) {}
     try { floatWin.weapon_friday_only.setButtonTintList(csl); } catch(e) {}
+    try { floatWin.resident_demand_thursday_gold_enabled.setButtonTintList(csl); } catch(e) {}
     var warFleetCheckboxIds = ["war_fleet_1_repair", "war_fleet_1_march", "war_fleet_2_repair", "war_fleet_2_march", "war_fleet_3_repair", "war_fleet_3_march"];
     for (var wc = 0; wc < warFleetCheckboxIds.length; wc++) {
         try { floatWin[warFleetCheckboxIds[wc]].setButtonTintList(csl); } catch(e) {}
     }
-    var schedulerCbIds = ["scheduler_cb_weapon", "scheduler_cb_food", "scheduler_cb_gather", "scheduler_cb_tradePort", "scheduler_cb_exhibition", "scheduler_cb_intelligence", "scheduler_cb_hangUpReward", "scheduler_cb_ship", "scheduler_cb_war"];
+    var schedulerCbIds = ["scheduler_cb_weapon", "scheduler_cb_food", "scheduler_cb_gather", "scheduler_cb_tradePort", "scheduler_cb_residentDemand", "scheduler_cb_exhibition", "scheduler_cb_intelligence", "scheduler_cb_resourceCollection", "scheduler_cb_ship", "scheduler_cb_war"];
     for (var sc = 0; sc < schedulerCbIds.length; sc++) {
         try { floatWin[schedulerCbIds[sc]].setButtonTintList(csl); } catch(e) {}
     }
+    ["resource_collection_hang_up", "resource_collection_experience", "resource_collection_factory"].forEach(function(id) {
+        try { floatWin[id].setButtonTintList(csl); } catch(e) {}
+    });
     for (var es = 0; es < EXHIBITION_SITE_OPTIONS.length; es++) {
         try { floatWin["exhibition_site_" + EXHIBITION_SITE_OPTIONS[es].key].setButtonTintList(csl); } catch(e) {}
     }
@@ -706,9 +913,13 @@ panel.expandPanel = function(ctx) {
     // 恢复 checkbox 状态（在绑定 click 之前）
     try { floatWin.war_reward_cb.setChecked(panel.warClaimReward); } catch(e) {}
     try { floatWin.weapon_friday_only.setChecked(panel.weaponFridayOnly); } catch(e) {}
-    ["weapon", "food", "gather", "tradePort", "exhibition", "intelligence", "hangUpReward", "ship", "war"].forEach(function(key) {
+    try { floatWin.resident_demand_thursday_gold_enabled.setChecked(panel.residentDemandThursdayGoldEnabled); } catch(e) {}
+    ["weapon", "food", "gather", "tradePort", "residentDemand", "exhibition", "intelligence", "resourceCollection", "ship", "war"].forEach(function(key) {
         try { floatWin["scheduler_cb_" + key].setChecked(panel.taskEnabled[key]); } catch(e) {}
     });
+    try { floatWin.resource_collection_hang_up.setChecked(panel.resourceCollection.hangUpReward); } catch(e) {}
+    try { floatWin.resource_collection_experience.setChecked(panel.resourceCollection.experience); } catch(e) {}
+    try { floatWin.resource_collection_factory.setChecked(panel.resourceCollection.factory); } catch(e) {}
     EXHIBITION_SITE_OPTIONS.forEach(function(option) {
         try { floatWin["exhibition_site_" + option.key].setChecked(panel.exhibitionSites.indexOf(option.label) >= 0); } catch(e) {}
     });
@@ -721,6 +932,14 @@ panel.expandPanel = function(ctx) {
     floatWin.weapon_friday_only.on("click", function() {
         try { panel.weaponFridayOnly = floatWin.weapon_friday_only.isChecked(); panel._saveConfig(); } catch(e) {}
     });
+    /**
+     * 保存周四金币模式开关。该开关只改变后续居民巡检的奖励类型，运行中的调度快照不得修改。
+     */
+    function saveResidentDemandThursdayGoldEnabled() {
+        if (panel.running) return;
+        try { panel.residentDemandThursdayGoldEnabled = floatWin.resident_demand_thursday_gold_enabled.isChecked(); panel._saveConfig(); } catch(e) {}
+    }
+    floatWin.resident_demand_thursday_gold_enabled.on("click", saveResidentDemandThursdayGoldEnabled);
 
     /**
      * 同步展区详情页和总调度页的间隔、时长及地点勾选状态，确保持久化配置的展示一致。
@@ -738,14 +957,22 @@ panel.expandPanel = function(ctx) {
      * 将总调度页的开关与间隔摘要同步到当前悬浮面板实例。
      */
     function refreshSchedulerSettings() {
-        ["weapon", "food", "gather", "tradePort", "exhibition", "intelligence", "hangUpReward", "ship", "war"].forEach(function(key) {
+        ["weapon", "food", "gather", "tradePort", "residentDemand", "exhibition", "intelligence", "resourceCollection", "ship", "war"].forEach(function(key) {
             try { floatWin["scheduler_cb_" + key].setChecked(panel.taskEnabled[key]); } catch(e) {}
             try { floatWin["scheduler_freq_" + key + "_t"].setText(getSchedulerIntervalText(key)); } catch(e) {}
         });
+        try { floatWin.resource_collection_hang_up.setChecked(panel.resourceCollection.hangUpReward); } catch(e) {}
+        try { floatWin.resource_collection_experience.setChecked(panel.resourceCollection.experience); } catch(e) {}
+        try { floatWin.resource_collection_factory.setChecked(panel.resourceCollection.factory); } catch(e) {}
+        try { floatWin.freq_hangUpReward_t.setText(panel.freq.hangUpReward + " 小时"); } catch(e) {}
+        try { floatWin.freq_resourceExperience_t.setText(panel.freq.resourceExperience + " 分钟"); } catch(e) {}
+        try { floatWin.freq_resourceFactory_t.setText(panel.freq.resourceFactory + " 分钟"); } catch(e) {}
+        try { floatWin.scheduler_resident_demand_state.setText(panel.getResidentDemandStatusText()); } catch(e) {}
+        try { floatWin.resident_demand_status_detail.setText(panel.getResidentDemandStatusText()); } catch(e) {}
         try { floatWin.scheduler_status.setText(panel.schedulerStatus); } catch(e) {}
     }
 
-    ["weapon", "food", "gather", "tradePort", "exhibition", "intelligence", "hangUpReward", "ship", "war"].forEach(function(key) {
+    ["weapon", "food", "gather", "tradePort", "residentDemand", "exhibition", "intelligence", "resourceCollection", "ship", "war"].forEach(function(key) {
         floatWin["scheduler_cb_" + key].on("click", function() {
             if (panel.running) return;
             panel.taskEnabled[key] = floatWin["scheduler_cb_" + key].isChecked();
@@ -754,13 +981,31 @@ panel.expandPanel = function(ctx) {
         floatWin["scheduler_freq_" + key].on("click", function() {
             if (panel.running) return;
             if (key === "tradePort") editTradePortFrequency();
+            else if (key === "residentDemand") editResidentDemandFrequency();
             else if (key === "gather") editGatherInterval();
             else if (key === "exhibition") editExhibitionFrequency();
             else if (key === "intelligence") editIntelligenceFrequency();
-            else if (key === "hangUpReward") editHangUpRewardFrequency();
+            else if (key === "resourceCollection") panel.openTaskDetail("resourceCollection");
+            else if (key === "ship") editShipPrepareMinutes();
             else editFrequency(key);
         });
     });
+
+    /**
+     * 保存资源收集子功能开关。子开关默认全部选中，但只有外层资源收集总开关开启后才会进入调度。
+     * @param {string} key 子功能配置键。
+     * @param {string} controlId 当前浮窗复选框 ID。
+     */
+    function bindResourceCollectionToggle(key, controlId) {
+        floatWin[controlId].on("click", function() {
+            if (panel.running) return;
+            panel.resourceCollection[key] = floatWin[controlId].isChecked();
+            panel._saveConfig();
+        });
+    }
+    bindResourceCollectionToggle("hangUpReward", "resource_collection_hang_up");
+    bindResourceCollectionToggle("experience", "resource_collection_experience");
+    bindResourceCollectionToggle("factory", "resource_collection_factory");
 
     /**
      * 绑定每个调度任务右侧的详情箭头。任务开关和频率卡片仍留在总调度页，
@@ -958,10 +1203,59 @@ panel.expandPanel = function(ctx) {
             }
         });
     }
-    ["food", "weapon", "ship", "war"].forEach(function(key) {
+    ["food", "weapon", "war"].forEach(function(key) {
         floatWin["freq_" + key + "_btn"].on("click", function() {
             if (!panel.running) editFrequency(key);
         });
+    });
+
+    /**
+     * 刷新商船准备、夺回重试时间及总调度摘要，确保保存后的分钟值同步展示。
+     */
+    function refreshShipTiming() {
+        try { floatWin.ship_prepare_minutes_t.setText(panel.shipPrepareMinutes + " 分钟"); } catch(e) {}
+        try { floatWin.ship_retry_minutes_t.setText(panel.shipRetryMinutes + " 分钟"); } catch(e) {}
+        refreshSchedulerSettings();
+    }
+
+    /**
+     * 编辑商船进入活动弹窗的提前时间。只接受正整数分钟，避免小数或文本导致整点边界计算不确定。
+     */
+    function editShipPrepareMinutes() {
+        dialogs.rawInput("提前进入时间（分钟）", panel.shipPrepareMinutes + "", function(val) {
+            if (val === null || panel.running) return;
+            var text = String(val).trim();
+            if (!/^[1-9][0-9]*$/.test(text)) {
+                toast("请输入正整数分钟");
+                return;
+            }
+            panel.shipPrepareMinutes = Number(text);
+            panel._saveConfig();
+            refreshShipTiming();
+        });
+    }
+    floatWin.ship_prepare_minutes_btn.on("click", function() {
+        if (!panel.running) editShipPrepareMinutes();
+    });
+
+    /**
+     * 编辑货轮仍在列表时的夺回重试间隔。只接受正整数分钟，避免无效值让限时任务持续触发。
+     */
+    function editShipRetryMinutes() {
+        dialogs.rawInput("夺回重试间隔（分钟）", panel.shipRetryMinutes + "", function(val) {
+            if (val === null || panel.running) return;
+            var text = String(val).trim();
+            if (!/^[1-9][0-9]*$/.test(text)) {
+                toast("请输入正整数分钟");
+                return;
+            }
+            panel.shipRetryMinutes = Number(text);
+            panel._saveConfig();
+            refreshShipTiming();
+        });
+    }
+    floatWin.ship_retry_minutes_btn.on("click", function() {
+        if (!panel.running) editShipRetryMinutes();
     });
 
     /**
@@ -981,6 +1275,67 @@ panel.expandPanel = function(ctx) {
     }
     floatWin.freq_tradePort_btn.on("click", function() {
         if (!panel.running) editTradePortFrequency();
+    });
+
+    /**
+     * 编辑居民需求的安全巡检间隔。该值以分钟保存，冷却起点由模块确认返回基地后写入的巡检时间决定。
+     */
+    function editResidentDemandFrequency() {
+        dialogs.rawInput("巡检间隔（分钟）", panel.freq.residentDemand + "", function(val) {
+            if (val === null || panel.running) return;
+            var text = String(val).trim();
+            if (!/^[1-9][0-9]*$/.test(text)) {
+                toast("请输入正整数分钟");
+                return;
+            }
+            panel.freq.residentDemand = Number(text);
+            panel._saveConfig();
+            try { floatWin.freq_residentDemand_t.setText(panel.freq.residentDemand + " 分钟"); } catch(e) {}
+            refreshSchedulerSettings();
+        });
+    }
+    floatWin.freq_residentDemand_btn.on("click", function() {
+        if (!panel.running) editResidentDemandFrequency();
+    });
+
+    /**
+     * 编辑居民需求默认使用的经验阈值。奖励必须严格大于该值才会提交，等于该值仍刷新。
+     */
+    function editResidentDemandExperienceThreshold() {
+        dialogs.rawInput("经验阈值（正整数）", panel.residentDemandExperienceThreshold + "", function(val) {
+            if (val === null || panel.running) return;
+            var text = String(val).trim();
+            if (!/^[1-9][0-9]*$/.test(text)) {
+                toast("请输入正整数经验阈值");
+                return;
+            }
+            panel.residentDemandExperienceThreshold = Number(text);
+            panel._saveConfig();
+            try { floatWin.resident_demand_experience_threshold_t.setText(panel.residentDemandExperienceThreshold + ""); } catch(e) {}
+        });
+    }
+    floatWin.resident_demand_experience_threshold_btn.on("click", function() {
+        if (!panel.running) editResidentDemandExperienceThreshold();
+    });
+
+    /**
+     * 编辑周四金币模式的金币阈值。该值始终可预设，但仅在开关开启的设备本地周四生效。
+     */
+    function editResidentDemandGoldThreshold() {
+        dialogs.rawInput("金币阈值（正整数）", panel.residentDemandGoldThreshold + "", function(val) {
+            if (val === null || panel.running) return;
+            var text = String(val).trim();
+            if (!/^[1-9][0-9]*$/.test(text)) {
+                toast("请输入正整数金币阈值");
+                return;
+            }
+            panel.residentDemandGoldThreshold = Number(text);
+            panel._saveConfig();
+            try { floatWin.resident_demand_gold_threshold_t.setText(panel.residentDemandGoldThreshold + ""); } catch(e) {}
+        });
+    }
+    floatWin.resident_demand_gold_threshold_btn.on("click", function() {
+        if (!panel.running) editResidentDemandGoldThreshold();
     });
 
     /**
@@ -1048,16 +1403,43 @@ panel.expandPanel = function(ctx) {
     });
 
     /**
-     * 返回总调度页显示的间隔摘要；打捞资源、贸易港口和展区使用分钟，情报与挂机奖励使用小时。
+     * 编辑资源收集子功能的分钟间隔。与挂机奖励分开校验，防止小时级配置被误写为分钟。
+     * @param {string} key 频率配置键。
+     * @param {string} label 输入框业务名称。
+     */
+    function editResourceCollectionFrequency(key, label) {
+        dialogs.rawInput(label + "间隔时间（分钟）", panel.freq[key] + "", function(val) {
+            if (val === null || panel.running) return;
+            var text = String(val).trim();
+            if (!/^[1-9][0-9]*$/.test(text)) {
+                toast("请输入正整数分钟");
+                return;
+            }
+            panel.freq[key] = Number(text);
+            panel._saveConfig();
+            refreshSchedulerSettings();
+        });
+    }
+    floatWin.freq_resourceExperience_btn.on("click", function() {
+        if (!panel.running) editResourceCollectionFrequency("resourceExperience", "收集资源");
+    });
+    floatWin.freq_resourceFactory_btn.on("click", function() {
+        if (!panel.running) editResourceCollectionFrequency("resourceFactory", "工厂生产收集");
+    });
+
+    /**
+     * 返回总调度页显示的间隔摘要；资源收集为任务组，因此只显示固定的三项功能数量。
      * @param {string} key 任务键。
      * @returns {string} 可展示的间隔文本。
      */
     function getSchedulerIntervalText(key) {
+        if (key === "ship") return "备" + panel.shipPrepareMinutes + " / 重" + panel.shipRetryMinutes + "分";
         if (key === "tradePort") return panel.freq.tradePort + "分";
+        if (key === "residentDemand") return panel.freq.residentDemand + "分";
         if (key === "gather") return panel.gatherIntervalMinutes + "分";
         if (key === "exhibition") return panel.freq.exhibition + "分";
         if (key === "intelligence") return panel.freq.intelligence + "小时";
-        if (key === "hangUpReward") return panel.freq.hangUpReward + "小时";
+        if (key === "resourceCollection") return "3 项";
         return panel.freq[key] + "s";
     }
 
@@ -1220,7 +1602,7 @@ panel.setRunningUI = function(running, C) {
             for (var r = 0; r < radioIds.length; r++) {
                 try { floatWin[radioIds[r]].setEnabled(!running); } catch(e) {}
             }
-            var clickIds = ["food_selector", "freq_food_btn", "freq_weapon_btn", "freq_tradePort_btn", "freq_exhibition_btn", "freq_intelligence_btn", "freq_hangUpReward_btn", "gather_interval_btn", "gather_threshold_btn", "gather_duration_btn", "freq_ship_btn", "freq_war_btn", "war_reward_cb", "war_fleet_1_target_btn", "war_fleet_1_repair", "war_fleet_1_march", "war_fleet_2_target_btn", "war_fleet_2_repair", "war_fleet_2_march", "war_fleet_3_target_btn", "war_fleet_3_repair", "war_fleet_3_march", "weapon_friday_only", "scheduler_cb_weapon", "scheduler_cb_tradePort", "scheduler_cb_exhibition", "scheduler_cb_intelligence", "scheduler_cb_hangUpReward", "scheduler_cb_gather", "scheduler_cb_food", "scheduler_cb_ship", "scheduler_cb_war", "scheduler_freq_weapon", "scheduler_freq_tradePort", "scheduler_freq_exhibition", "scheduler_freq_intelligence", "scheduler_freq_hangUpReward", "scheduler_freq_gather", "scheduler_freq_food", "scheduler_freq_ship", "scheduler_freq_war", "wtype_gun", "wtype_armor", "wtype_blade", "wlevel_blue", "wlevel_purple", "wlevel_orange"];
+            var clickIds = ["food_selector", "freq_food_btn", "freq_weapon_btn", "freq_tradePort_btn", "freq_residentDemand_btn", "resident_demand_experience_threshold_btn", "resident_demand_thursday_gold_enabled", "resident_demand_gold_threshold_btn", "freq_exhibition_btn", "freq_intelligence_btn", "freq_hangUpReward_btn", "freq_resourceExperience_btn", "freq_resourceFactory_btn", "resource_collection_hang_up", "resource_collection_experience", "resource_collection_factory", "gather_interval_btn", "gather_threshold_btn", "gather_duration_btn", "ship_prepare_minutes_btn", "ship_retry_minutes_btn", "freq_war_btn", "war_reward_cb", "war_fleet_1_target_btn", "war_fleet_1_repair", "war_fleet_1_march", "war_fleet_2_target_btn", "war_fleet_2_repair", "war_fleet_2_march", "war_fleet_3_target_btn", "war_fleet_3_repair", "war_fleet_3_march", "weapon_friday_only", "scheduler_cb_weapon", "scheduler_cb_tradePort", "scheduler_cb_residentDemand", "scheduler_cb_exhibition", "scheduler_cb_intelligence", "scheduler_cb_resourceCollection", "scheduler_cb_gather", "scheduler_cb_food", "scheduler_cb_ship", "scheduler_cb_war", "scheduler_freq_weapon", "scheduler_freq_tradePort", "scheduler_freq_residentDemand", "scheduler_freq_exhibition", "scheduler_freq_intelligence", "scheduler_freq_resourceCollection", "scheduler_freq_gather", "scheduler_freq_food", "scheduler_freq_ship", "scheduler_freq_war", "wtype_gun", "wtype_armor", "wtype_blade", "wlevel_blue", "wlevel_purple", "wlevel_orange"];
             // 详情箭头与配置字段同属运行快照，运行期间必须禁止进入详情页。
             TASK_DETAIL_PAGES.forEach(function(page) {
                 clickIds.push("scheduler_detail_" + page.key);
@@ -1242,7 +1624,7 @@ panel.getCountText = function() { return null; };
  * 返回当前已开启的任务键，用于启动前校验。
  */
 panel.getEnabledTasks = function() {
-    return ["weapon", "food", "gather", "tradePort", "exhibition", "intelligence", "hangUpReward", "ship", "war"].filter(function(key) { return panel.taskEnabled[key]; });
+    return ["weapon", "food", "gather", "tradePort", "residentDemand", "exhibition", "intelligence", "resourceCollection", "ship", "war"].filter(function(key) { return panel.taskEnabled[key]; });
 };
 
 /**
